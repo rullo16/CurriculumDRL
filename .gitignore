@@ -6,3 +6,4 @@
 /UnityCrashHandler64.exe
 /UnityPlayer.dll
 /WinPixEventRuntime.dll
+*.cpython-310.pyc

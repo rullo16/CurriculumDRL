@@ -49,7 +49,7 @@ class KnowledgeDistillationNetwork(nn.Module):
     def __init__(self, input_channels):
         super(KnowledgeDistillationNetwork, self).__init__()
         self.convolutional_pipeline = nn.Sequential(
-            FeatureExtrationBlock(input_channels, 32),
+            FeatureExtrationBlock(input_channels[0], 32),
             FeatureExtrationBlock(32, 64),
             FeatureExtrationBlock(64, 128),
             nn.ReLU(),
@@ -75,7 +75,7 @@ class PPONetWithDistillation(nn.Module):
         self.conv_out_size = self._get_conv_out(self.camera_obs_dim)
 
         self.fully_connected_pipeline = nn.Sequential(
-            nn.Linear(self.conv_out_size + vector_obs_dims, 512),
+            nn.Linear(self.conv_out_size + vector_obs_dims[0], 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
@@ -84,7 +84,7 @@ class PPONetWithDistillation(nn.Module):
         )
 
         self.actor = nn.Sequential(
-            nn.Linear(128, n_actions),
+            nn.Linear(128, n_actions[0]),
             nn.Softmax(dim=-1)
         )
 
@@ -93,7 +93,8 @@ class PPONetWithDistillation(nn.Module):
         )
 
     def _get_conv_out(self, shape):
-        o = KnowledgeDistillationNetwork(torch.zeros(1, *shape))
+        cnn = KnowledgeDistillationNetwork(shape)
+        o = cnn(torch.zeros(1, *shape))
         return int(np.prod(o.size()))
     
     def forward(self, camera_obs, vector_obs):

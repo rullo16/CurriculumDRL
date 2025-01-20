@@ -5,19 +5,20 @@ from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
 class ExperienceBuffer:
 
-    def __init__(self, camera_obs_dim, vector_obs_dim, params):
+    def __init__(self, camera_obs_dim, vector_obs_dim, action_dim, params):
 
         self.camera_obs_dims = camera_obs_dim
         self.vector_obs_dims = vector_obs_dim
+        self.action_dim = action_dim
         self.max_steps = params.max_steps
-        self.discount_factor = params.discount_factor
-        self.lambda_factor = params.lambda_factor
+        self.discount_factor = params.gamma
+        self.lambda_factor = params.lam
         self.batch_size = params.batch_size
         self.mini_batch_size = params.mini_batch_size
 
         self.camera_obs = torch.zeros(self.max_steps+1, *self.camera_obs_dims)
         self.vector_obs = torch.zeros(self.max_steps+1, *self.vector_obs_dims)
-        self.action_memory = torch.zeros(self.max_steps,)
+        self.action_memory = torch.zeros(self.max_steps, *self.action_dim)
         self.rewards_split = torch.zeros(self.max_steps+1,2)
         self.accumulated_rewards = torch.zeros(self.max_steps+1,)
         self.done_flags = torch.zeros(self.max_steps+1,)
@@ -30,16 +31,18 @@ class ExperienceBuffer:
         self.ext_ref_values = torch.zeros(self.max_steps+1,)
 
         self.step = 0
+        
 
     def add(self, camera_obs, vector_obs, action, rewards, done, log_prob, ext_value, int_value):
-        self.camera_obs[self.step].copy_(camera_obs)
-        self.vector_obs[self.step].copy_(vector_obs)
-        self.action_memory[self.step] = action
-        self.rewards_split[self.step] = rewards
-        self.done_flags[self.step] = done
-        self.action_log_probs[self.step] = log_prob
-        self.ext_values_estimations[self.step] = ext_value
-        self.int_values_estimations[self.step] = int_value
+
+        self.camera_obs[self.step].copy_(torch.as_tensor(camera_obs, dtype=torch.float32))
+        self.vector_obs[self.step].copy_(torch.as_tensor(vector_obs, dtype=torch.float32))
+        self.action_memory[self.step] = torch.as_tensor(action, dtype=torch.float32)
+        self.rewards_split[self.step] = torch.as_tensor(rewards, dtype=torch.float32)
+        self.done_flags[self.step] = torch.as_tensor(done, dtype=torch.float32)
+        self.action_log_probs[self.step] = torch.as_tensor(log_prob, dtype=torch.float32)
+        self.ext_values_estimations[self.step] = torch.as_tensor(ext_value, dtype=torch.float32)
+        self.int_values_estimations[self.step] = torch.as_tensor(int_value, dtype=torch.float32)
 
         self.step = (self.step + 1) % self.max_steps
 

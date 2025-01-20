@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-Hyperparameters = {
+HYPERPARAMS = {
     'ppo_distilled': SimpleNamespace(**{
         'stop_reward': 200.0,
         'gamma': 0.99,
@@ -16,6 +16,8 @@ Hyperparameters = {
         'clip_grad_norm': 0.5,
         'distillation_coef': 0.5,
         'n_steps': 2048,
+        'n_steps_random_exploration': 10000,
+        'max_steps': 1000000,
     }
     ),
 }
