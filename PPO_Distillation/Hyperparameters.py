@@ -18,6 +18,9 @@ HYPERPARAMS = {
         'n_steps': 2048,
         'n_steps_random_exploration': 10000,
         'max_steps': 1000000,
+        'action_std': 0.5,
+        'seed_episodes': 5,
+        'test_steps': 1000,
     }
     ),
 }

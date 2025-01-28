@@ -57,11 +57,15 @@ class KnowledgeDistillationNetwork(nn.Module):
             nn.Dropout(0.5),
         )
 
+        self.distilled_converter = nn.Linear(18432, 768)
+
         self.convolutional_pipeline.apply(xavier_initialization)
 
-    def forward(self, x):
+    def forward(self, x, distill=False):
         normalized_x = x/255.0
         conv_out = self.convolutional_pipeline(normalized_x).view(normalized_x.size(0), -1)
+        if distill:
+            return self.distilled_converter(conv_out)
         return conv_out
     
 class PPONetWithDistillation(nn.Module):
@@ -100,6 +104,9 @@ class PPONetWithDistillation(nn.Module):
     def forward(self, camera_obs, vector_obs):
         normalized_camera_obs = camera_obs/255.0
         conv_out = self.convolution_pipeline(normalized_camera_obs)
+        if len(vector_obs.shape) == 1:
+            vector_obs = vector_obs.unsqueeze(0) # Add this line to match dimensions
+        
         fc_input = torch.cat([conv_out, vector_obs], dim=1)
         fc_out = self.fully_connected_pipeline(fc_input)
         return self.actor(fc_out), self.critic(fc_out)
