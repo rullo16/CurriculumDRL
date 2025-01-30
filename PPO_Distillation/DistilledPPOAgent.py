@@ -56,6 +56,28 @@ class DistilledPPO:
             param_group['lr'] = lr
         return optimizer
     
+    def fine_tune_teacher(self, trajectories):
+        self.distilled_teacher.train()
+        self.distill_student.train()
+        self.distill_student.zero_grad()
+        self.distilled_teacher.zero_grad()
+        for _ in range(self.params.train_epochs):
+            generator = trajectories.sample()
+            for sample in generator:
+                camera_obs, _, _, _, _, _, _ = sample
+                camera_obs_rescaled = (camera_obs * 255).byte()
+                teacher_in = self.processor(images=camera_obs_rescaled, return_tensors="pt").pixel_values.to(device)
+                teacher_out = self.distilled_teacher(teacher_in).last_hidden_state[:, 0, :]
+                soft_teacher = F.softmax(teacher_out, dim=-1)
+                student_out = self.distill_student(camera_obs, distill=True)
+                log_soft_student = F.log_softmax(student_out, dim=-1)
+                distill_loss = F.kl_div(log_soft_student, soft_teacher, reduction='batchmean')
+                distill_loss.backward()
+                self.optimizer_distill.step()
+                self.optimizer_distill.zero_grad()
+        self.distilled_teacher.eval()
+        self.distill_student.eval()
+    
     def train(self, steps, trajectories):
         batch_size = self.params.n_steps // self.mini_batch_size
         if batch_size < self.mini_batch_size:
@@ -122,5 +144,8 @@ class DistilledPPO:
                     self.optimizer.zero_grad()
                 grad_step += 1
 
-    def load_model(self, model_path):
+    def load_model(self, model_path="ppo_distill.pth"):
         self.net.load_state_dict(torch.load(model_path, weights_only=True))
+
+    def save_model(self, model_path="ppo_distill.pth"):
+        torch.save(self.net.state_dict(), model_path)
