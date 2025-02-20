@@ -4,26 +4,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Select device automatically
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def xavier_initialization(module, gain=1.0):
-    # Leverages Xavier initialization for stable layer outputs
     if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
         nn.init.xavier_uniform_(module.weight.data, gain)
         nn.init.constant_(module.bias.data, 0)
     return module
 
 def orthogonal_initialization(module, gain=nn.init.calculate_gain('relu')):
-    # Orthogonal initialization for robust training
     if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
         nn.init.orthogonal_(module.weight.data, gain)
         nn.init.constant_(module.bias.data, 0)
     return module
 
-class ResidualBlock(nn.Module):
-    # Adds a residual connection for better gradient flow
+class SkipConnectionBlock(nn.Module):
     def __init__(self, input_channels):
-        super(ResidualBlock, self).__init__()
+        super(SkipConnectionBlock, self).__init__()
         self.convolutional_block = nn.Sequential(
             nn.Conv2d(input_channels, input_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -31,33 +28,30 @@ class ResidualBlock(nn.Module):
         )
 
     def forward(self, x):
-        # Output is input plus transformed input
-        return x+self.convolutional_block(x)
+        return x + self.convolutional_block(x)
     
-class IMPALAEncoder(nn.Module):
-    # IMPALA-inspired encoder for visual feature extraction
+class FeatureExtrationBlock(nn.Module):
     def __init__(self, input_channels, output_channels):
-        super(IMPALAEncoder, self).__init__()
+        super(FeatureExtrationBlock, self).__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(input_channels, output_channels, kernel_size=3, stride=1, padding=1),
             nn.MaxPool2d(kernel_size=2, stride=2, padding=1),
             nn.ReLU(),
-            ResidualBlock(output_channels),
+            SkipConnectionBlock(output_channels),
             nn.ReLU(),
-            ResidualBlock(output_channels)
+            SkipConnectionBlock(output_channels)
         )
 
     def forward(self, x):
         return self.layers(x)
     
 class KnowledgeDistillationNetwork(nn.Module):
-    # Outputs feature or distilled representation based on 'distill' flag
     def __init__(self, input_channels):
         super(KnowledgeDistillationNetwork, self).__init__()
         self.convolutional_pipeline = nn.Sequential(
-            IMPALAEncoder(input_channels[0], 32),
-            IMPALAEncoder(32, 64),
-            IMPALAEncoder(64, 128),
+            FeatureExtrationBlock(input_channels[0], 32),
+            FeatureExtrationBlock(32, 64),
+            FeatureExtrationBlock(64, 128),
             nn.ReLU(),
             nn.Flatten(),
             nn.Dropout(0.5),
@@ -68,17 +62,15 @@ class KnowledgeDistillationNetwork(nn.Module):
         self.convolutional_pipeline.apply(xavier_initialization)
 
     def forward(self, x, distill=False):
-        # Distilled output is a compact representation for knowledge transfer
-        normalized_x = x/255.0
+        normalized_x = x / 255.0
         conv_out = self.convolutional_pipeline(normalized_x).view(normalized_x.size(0), -1)
         if distill:
             return self.distilled_converter(conv_out)
         return conv_out
     
-class PPONetWithDistillation(nn.Module):
-    # Integrates vision and vector inputs into a PPO actor-critic model
+class SACNetWithDistillation(nn.Module):
     def __init__(self, convolution_pipeline, camera_obs_dim, vector_obs_dims, n_actions):
-        super(PPONetWithDistillation, self).__init__()
+        super(SACNetWithDistillation, self).__init__()
         self.camera_obs_dim = camera_obs_dim
         self.vector_obs_dims = vector_obs_dims
         self.n_actions = n_actions
@@ -97,11 +89,23 @@ class PPONetWithDistillation(nn.Module):
 
         self.actor = nn.Sequential(
             nn.Linear(128, n_actions[0]),
-            nn.Softmax(dim=-1)
+            nn.Tanh()
         )
 
-        self.critic = nn.Sequential(
-            nn.Linear(128, 1)
+        self.critic_1 = nn.Sequential(
+            nn.Linear(128 + n_actions[0], 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+        self.critic_2 = nn.Sequential(
+            nn.Linear(128 + n_actions[0], 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
         )
 
     def _get_conv_out(self, shape):
@@ -110,14 +114,25 @@ class PPONetWithDistillation(nn.Module):
         return int(np.prod(o.size()))
     
     def forward(self, camera_obs, vector_obs):
-        # Returns policy logits (actor) and state value (critic)
-        normalized_camera_obs = camera_obs/255.0
+        normalized_camera_obs = camera_obs / 255.0
         conv_out = self.convolution_pipeline(normalized_camera_obs)
         if len(vector_obs.shape) == 1:
-            vector_obs = vector_obs.unsqueeze(0) # Add this line to match dimensions
+            vector_obs = vector_obs.unsqueeze(0)  # Add this line to match dimensions
         
         fc_input = torch.cat([conv_out, vector_obs], dim=1)
         fc_out = self.fully_connected_pipeline(fc_input)
-        return self.actor(fc_out), self.critic(fc_out)
+        return self.actor(fc_out)
+
+    def get_critics(self, camera_obs, vector_obs, actions):
+        normalized_camera_obs = camera_obs / 255.0
+        conv_out = self.convolution_pipeline(normalized_camera_obs)
+        if len(vector_obs.shape) == 1:
+            vector_obs = vector_obs.unsqueeze(0)  # Add this line to match dimensions
+        
+        fc_input = torch.cat([conv_out, vector_obs], dim=1)
+        fc_out = self.fully_connected_pipeline(fc_input)
+        critic_input = torch.cat([fc_out, actions], dim=1)
+        return self.critic_1(critic_input), self.critic_2(critic_input)
 
 
+        

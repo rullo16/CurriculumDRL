@@ -65,6 +65,7 @@ class DistilledPPO:
             generator = trajectories.sample()
             for sample in generator:
                 camera_obs, _, _, _, _, _, _ = sample
+                camera_obs = camera_obs.to(device)
                 camera_obs_rescaled = (camera_obs * 255).byte()
                 teacher_in = self.processor(images=camera_obs_rescaled, return_tensors="pt").pixel_values.to(device)
                 teacher_out = self.distilled_teacher(teacher_in).last_hidden_state[:, 0, :]

@@ -23,4 +23,21 @@ HYPERPARAMS = {
         'test_steps': 1000,
     }
     ),
+    'sac_distilled': SimpleNamespace(**{
+        'stop_reward': 200.0,
+        'gamma': 0.99,
+        'tau': 0.005,
+        'alpha': 0.2,
+        'lr': 3e-4,
+        'hidden_size': 256,
+        'batch_size': 256,
+        'replay_size': 1000000,
+        'replay_initial': 10000,
+        'n_steps': 1000000,
+        'n_steps_random_exploration': 10000,
+        'max_steps': 1000000,
+        'seed_episodes': 5,
+        'test_steps': 1000,
+    }
+    ),
 }
