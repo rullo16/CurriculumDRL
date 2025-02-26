@@ -1,9 +1,7 @@
 import torch
-import numpy as np
-from collections import deque
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
-class ExperienceBuffer:
+class PPO_ExperienceBuffer:
 
     def __init__(self, camera_obs_dim, vector_obs_dim, action_dim, params):
 

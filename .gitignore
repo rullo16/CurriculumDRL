@@ -8,3 +8,4 @@
 /WinPixEventRuntime.dll
 *.cpython-310.pyc
 /wandb
+/SavedModels/

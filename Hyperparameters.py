@@ -20,24 +20,29 @@ HYPERPARAMS = {
         'max_steps': 1000000,
         'action_std': 0.3,
         'seed_episodes': 5,
-        'test_steps': 1000,
-    }
-    ),
+    }),
     'sac_distilled': SimpleNamespace(**{
         'stop_reward': 200.0,
-        'gamma': 0.99,
-        'tau': 0.005,
-        'alpha': 0.2,
-        'lr': 3e-4,
-        'hidden_size': 256,
+        'lambda_factor': 0.95,
+        'gamma': 0.907,
+        'tau': 0.005,                       # soft update coefficient
+        'buffer_size': 1000000,             # replay buffer size
         'batch_size': 256,
-        'replay_size': 1000000,
-        'replay_initial': 10000,
-        'n_steps': 1000000,
+        'actor_lr': 3e-4,                   # learning rate for the actor
+        'critic_lr': 3e-4,                  # learning rate for the critic
+        'alpha_lr': 3e-4,                   # learning rate for entropy coefficient
+        'distill_lr': 3e-4,                 # learning rate for the distilled policy
+        'automatic_entropy_tuning': True,   # enable automatic entropy tuning
+        'target_update_interval': 1,
+        'train_iterations': 1,
+        'n_steps': 2048,
         'n_steps_random_exploration': 10000,
-        'max_steps': 1000000,
-        'seed_episodes': 5,
-        'test_steps': 1000,
-    }
-    ),
+        # 'max_steps': 1000000,
+        'max_steps': 10000,
+        # 'seed_episodes': 5,
+        'seed_episodes': 2,
+        'batch_size': 64,
+        'mini_batch_size': 64,
+        'train_epochs': 10,
+    }),
 }
