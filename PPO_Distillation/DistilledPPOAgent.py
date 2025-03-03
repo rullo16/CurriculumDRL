@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from .Trajectories import ExperienceBuffer
+from .Trajectories import PPO_ExperienceBuffer
 from .Nets import PPONetWithDistillation, KnowledgeDistillationNetwork
 from transformers import AutoImageProcessor, ViTModel
 
