@@ -2,12 +2,12 @@ from types import SimpleNamespace
 
 HYPERPARAMS = {
     'ppo_distilled': SimpleNamespace(**{
-        'gamma': 0.99,  # Discount factor for future rewards
+        'gamma': 0.97,  # Discount factor for future rewards
         'lam': 0.95,  # GAE (Generalized Advantage Estimation) lambda
         'train_epochs': 10,  # Number of training epochs per update
         'epsilon': 0.2,  # PPO clipping parameter
         'value_loss_coef': 0.5,  # Coefficient for value function loss
-        'entropy_coef': 0.01,  # Coefficient for entropy regularization
+        'entropy_coef': 0.03,  # Coefficient for entropy regularization
         'lr': 3e-4,  # Learning rate
         'trajectory_length': 2048,  # Number of steps per trajectory rollout
         'batch_size': 2048,  # Batch size for training
@@ -28,6 +28,7 @@ HYPERPARAMS = {
         'alpha_lr': 3e-4,
         'entropy_lr': 3e-4,
         'distill_lr': 3e-4,
+        'distill_coef': 0.5,
         'buffer_size': 100000,
         'batch_size': 256,
         'lambda_': 0.95,

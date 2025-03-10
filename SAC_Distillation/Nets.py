@@ -113,23 +113,118 @@ class FeatureExtractionNet(nn.Module):
             return self.distilled_converter(conv_out)
         return conv_out
     
-class AttentionMudule(nn.Module):
-    def __init__(self,input_shape):
-        super(AttentionMudule, self).__init__()
-        self.query = nn.Linear(input_shape, 258)
-        self.key = nn.Linear(input_shape, 258)
-        self.value = nn.Linear(input_shape, 258)
-        self.scale = torch.sqrt(torch.tensor([258])).to(device)
+# class AttentionMudule(nn.Module):
+    # def __init__(self,input_shape):
+    #     super(AttentionMudule, self).__init__()
+    #     self.query = nn.Linear(input_shape, 258)
+    #     self.key = nn.Linear(input_shape, 258)
+    #     self.value = nn.Linear(input_shape, 258)
+    #     self.scale = torch.sqrt(torch.tensor([258])).to(device)
+
+    # def forward(self, x):
+    #     queries = self.query(x)
+    #     keys = self.key(x)
+    #     values = self.value(x)
+
+    #     attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / self.scale
+    #     attention_weights = F.softmax(attention_scores, dim=-1)
+    #     attended_values = torch.matmul(attention_weights, values)
+    #     return attended_values
+
+class SparseAttention(nn.Module):
+    def __init__(self, input_dim, head_dim=64):
+        super(SparseAttention, self).__init__()
+        self.query = nn.Linear(input_dim, head_dim)
+        self.key = nn.Linear(input_dim, head_dim)
+        self.value = nn.Linear(input_dim, head_dim)
+        self.scale = np.sqrt(head_dim)
 
     def forward(self, x):
-        queries = self.query(x)
-        keys = self.key(x)
-        values = self.value(x)
+        Q = self.query(x)  # [batch_size, head_dim]
+        K = self.key(x)    # [batch_size, head_dim]
+        V = self.value(x)  # [batch_size, head_dim]
 
-        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / self.scale
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attended_values = torch.matmul(attention_weights, values)
-        return attended_values
+        attn_scores = (Q @ K.T) / self.scale  # [batch_size, batch_size]
+        attention_weights = F.softmax(attn_scores, dim=-1)  # [batch_size, batch_size]
+
+        # explicitly correct operation to get correct shape:
+        attended_output = attention_weights @ V  # [batch_size, head_dim]
+
+        return attended_output  # explicitly correct shape
+
+
+class AdaptiveAttention(nn.Module):
+    def __init__(self, input_dim, max_heads=4, head_dim=64):
+        super(AdaptiveAttention, self).__init__()
+        self.max_heads = max_heads
+        self.head_selector = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16, max_heads),
+            nn.Softmax(dim=-1)
+        )
+        self.attention_heads = nn.ModuleList(
+            [SparseAttention(input_dim, head_dim) for _ in range(max_heads)]
+        )
+        self.output_layer = nn.Linear(head_dim, input_dim)
+
+    def forward(self, x, step_fraction):
+        """
+        x: Tensor [batch_size, input_dim]
+        step_fraction: Scalar tensor indicating training progress [0,1]
+        """
+        # Determine number of heads dynamically
+        step_tensor = torch.tensor([[step_fraction]], device=device)
+        head_logits = self.head_selector(step_tensor).view(self.max_heads, 1,1)  # [1, max_heads]
+        # Collect outputs from all heads explicitly
+        attention_outputs = torch.stack(
+            [head(x) for head in self.attention_heads], dim=0  # [max_heads, batch_size, head_dim]
+        )
+
+        # Explicitly compute weighted sum (smooth adaptive attention)
+        combined_attention = torch.sum(attention_outputs * head_logits, dim=0)  # [batch_size, head_dim]
+
+        # Project back to input_dim explicitly
+        final_attention = self.output_layer(combined_attention)  # [batch_size, input_dim]
+
+        return final_attention  # [batch_size, input_dim]
+
+class EntropyTargetNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(1,16),
+            nn.ReLU(),
+            nn.Linear(16,1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return -2.0 * self.fc(x)
+
+class CriticNet(nn.Module):
+    def __init__(self, action_dim, hidden_dim=256):
+        super(CriticNet, self).__init__()
+        self.q1 = nn.Sequential(
+            nn.Linear(action_dim + hidden_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1)
+        )
+        self.q1.apply(xavier_initialization)
+
+        self.q2 = nn.Sequential(
+            nn.Linear(action_dim + hidden_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1)
+        )
+        self.q2.apply(xavier_initialization)
+    
+    def forward(self, x):
+        return self.q1(x), self.q2(x)
     
 class SACNet(nn.Module):
     def __init__(self, camera_obs_dim, vector_obs_dim, n_actions, num_agents):
@@ -162,25 +257,15 @@ class SACNet(nn.Module):
             nn.Softplus()
         )
 
-        self.attention = AttentionMudule((256+n_actions[0]))
+        self.attention = AdaptiveAttention(256 + self.n_actions[0])
 
-        self.critic_1 = nn.Sequential(
-            nn.Linear(258, 128),  # modified input features from 258*num_agents to 258
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 1)
-        )
+        self.critic = CriticNet(self.n_actions[0], 256)
 
-        self.critic_2 = nn.Sequential(
-            nn.Linear(258, 128),  # modified input features from 258*num_agents to 258
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 1)
-        )
+        self.target_critic = CriticNet(self.n_actions[0], 256)
 
         self.fully_connected_pipeline.apply(xavier_initialization)
         self.actor_mean.apply(xavier_initialization)
         self.actor_std.apply(xavier_initialization)
-        self.critic_1.apply(xavier_initialization)
-        self.critic_2.apply(xavier_initialization)
 
     def _get_conv_out(self, shape):
         self.convolution_pipeline.eval()
@@ -200,17 +285,25 @@ class SACNet(nn.Module):
         action_log_std = torch.clamp(action_log_std, -20, 2)
         return action_mean, action_log_std
     
-    def get_values(self, camera_obs, vector_obs, action_mean):
+    def get_values(self, camera_obs, vector_obs, actions, step_fraction, target=False):
         if vector_obs.dim() == 1:
             vector_obs = vector_obs.unsqueeze(0)
-        if action_mean.dim() == 1:
-            action_mean = action_mean.unsqueeze(0)
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
 
-        conv_out = self.convolution_pipeline(camera_obs)
+        conv_out = self.convolution_pipeline(camera_obs)  # [batch_size, conv_dim]
         fc_input = torch.cat([conv_out, vector_obs], dim=1).to(device)
         fc_out = self.fully_connected_pipeline(fc_input)
-        critic_input = torch.cat([fc_out, action_mean], dim=1).to(device)
-        critic_input = self.attention(critic_input)
-        value_1 = self.critic_1(critic_input)
-        value_2 = self.critic_2(critic_input)
-        return value_1, value_2
+
+        critic_input = torch.cat([fc_out, actions], dim=1).to(device)
+
+        # explicitly correct attention layer output shape
+        critic_input = self.attention(critic_input, step_fraction)  # explicitly [batch_size, hidden_dim]
+
+        if critic_input.dim() != 2:
+            critic_input = critic_input.view(critic_input.size(0), -1)
+
+        # clearly defined critics returning [batch_size, 1]
+        if target:
+            return self.target_critic(critic_input)
+        return self.critic(critic_input)
