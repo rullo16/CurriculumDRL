@@ -1,1 +1,5 @@
-
+/Linux_Env filter=lfs diff=lfs merge=lfs -text
+Linux_Env filter=lfs diff=lfs merge=lfs -text
+Linux_Env/UnityPlayer.so filter=lfs diff=lfs merge=lfs -text
+Linux_Env/UnityPlayer_s.debug filter=lfs diff=lfs merge=lfs -text
+Linux_Env/DroneCity_Data/sharedassets0.assets.resS filter=lfs diff=lfs merge=lfs -text
