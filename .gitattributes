@@ -1,10 +1,1 @@
-UnityPlayer.dll filter=lfs diff=lfs merge=lfs -text
-DroneFlightv1_Data/sharedassets0.assets.resS filter=lfs diff=lfs merge=lfs -text
-/D3D12 filter=lfs diff=lfs merge=lfs -text
-/DroneFlightv1.exe filter=lfs diff=lfs merge=lfs -text
-/DroneFlightv1_BurstDebugInformation_DoNotShip filter=lfs diff=lfs merge=lfs -text
-/DroneFlightv1_Data filter=lfs diff=lfs merge=lfs -text
-/MonoBleedingEdge filter=lfs diff=lfs merge=lfs -text
-/UnityCrashHandler64.exe filter=lfs diff=lfs merge=lfs -text
-/UnityPlayer.dll filter=lfs diff=lfs merge=lfs -text
-/WinPixEventRuntime.dll filter=lfs diff=lfs merge=lfs -text
+

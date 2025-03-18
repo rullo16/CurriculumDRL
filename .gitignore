@@ -1,11 +1,11 @@
-# /D3D12
-# /DroneFlightv1.exe
-# /DroneFlightv1_BurstDebugInformation_DoNotShip
-# /DroneFlightv1_Data
-# /MonoBleedingEdge
-# /UnityCrashHandler64.exe
-# /UnityPlayer.dll
-# /WinPixEventRuntime.dll
+/D3D12
+/DroneFlightv1.exe
+/DroneFlightv1_BurstDebugInformation_DoNotShip
+/DroneFlightv1_Data
+/MonoBleedingEdge
+/UnityCrashHandler64.exe
+/UnityPlayer.dll
+/WinPixEventRuntime.dll
 *.cpython-310.pyc
 /wandb
 /SavedModels/
