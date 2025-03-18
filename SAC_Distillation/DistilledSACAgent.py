@@ -139,6 +139,9 @@ class DistilledSAC:
                 optimizer.zero_grad()
                 total_loss.backward()
                 optimizer.step()
+        
+            print("Epoch {} completed".format(epoch))
+        print("Teacher model fine-tuning completed")
     
     def train(self, trajectories, step):
         if len(trajectories) < self.params.batch_size:
@@ -178,11 +181,12 @@ class DistilledSAC:
                 q_target = torch.minimum(q1_target, q2_target,)  # [batch_size, 1] clearly
                 next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True)  # [batch_size, 1]
 
-                target_q = rewards + (1 - done_flags) * self.params.gamma * (q_target - self.alpha * next_log_prob)
+                target_q = rewards + (1 - done_flags) * self.params.gamma * (q_target - self.alpha * next_log_prob).squeeze(-1)
                 
 
             q1, q2 = self.model.get_values(camera_obs, vector_obs, actions, step_fraction)
-
+            q1 = q1.squeeze(-1)
+            q2 = q2.squeeze(-1)
             critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
             self.critic_optim.zero_grad()

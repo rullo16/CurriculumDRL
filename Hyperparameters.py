@@ -34,7 +34,7 @@ HYPERPARAMS = {
         'lambda_': 0.95,
         'target_entropy': -2,
         'train_epochs': 10,
-        'seed_episodes': 5,
+        'seed_episodes': 3,
         'max_steps': 1000000,
         'n_steps': 2048,
         'n_steps_random_exploration': 10000,
