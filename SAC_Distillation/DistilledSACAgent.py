@@ -227,8 +227,9 @@ class DistilledSAC:
             # -----------------------------------------------------
             # Distillation Training (explicitly corrected)
             # -----------------------------------------------------
+            print("Distillation Training")
             replay_buffer = DistillationDataset(trajectories, self.model.convolution_pipeline, num_samples=trajectories.size)
-            dataloader = DataLoader(replay_buffer, batch_size=64, shuffle=True) 
+            dataloader = DataLoader(replay_buffer, batch_size=256, shuffle=True) 
             for camera_obs, student_feats in dataloader:
                 camera_obs = camera_obs.to(device)
                 student_feats = student_feats.to(device).squeeze(1)
@@ -245,4 +246,8 @@ class DistilledSAC:
                 self.distill_optimizer.zero_grad()
                 distill_loss.backward()
                 self.distill_optimizer.step()
+            
+            print("Actor Loss: {:.4f}, Critic Loss: {:.4f}, Entropy Loss: {:.4f}, Distillation Loss: {:.4f}".format(
+                actor_loss.item(), critic_loss.item(), entropy_loss.item(), distill_loss.item()
+            ))
 

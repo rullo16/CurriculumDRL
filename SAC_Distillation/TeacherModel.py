@@ -30,7 +30,7 @@ class DistillationDataset(torch.utils.data.Dataset):
 class TeacherModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.teacher = MobileViTModel.from_pretrained("apple/mobilevit-small")
+        self.teacher = MobileViTModel.from_pretrained("SavedModels/Teacher")
         self.head = nn.Linear(640, 12800)
         self.processor = MobileViTImageProcessor.from_pretrained("apple/mobilevit-small", do_rescale=False)
 
@@ -54,3 +54,6 @@ class TeacherModel(nn.Module):
         distances = torch.cdist(features, features, p=2)
         loss = torch.mean(torch.relu(margin - distances))
         return loss
+    
+    def save(self, path):
+        self.teacher.save_pretrained(path)

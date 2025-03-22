@@ -33,7 +33,7 @@ HYPERPARAMS = {
         'batch_size': 256,
         'lambda_': 0.95,
         'target_entropy': -2,
-        'train_epochs': 10,
+        'train_epochs': 5,
         'seed_episodes': 3,
         'max_steps': 1000000,
         'n_steps': 2048,
