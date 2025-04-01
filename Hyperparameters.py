@@ -21,22 +21,36 @@ HYPERPARAMS = {
         'seed_episodes': 5,  # Number of episodes for seeding
     }),
     'sac_distilled': SimpleNamespace(**{
-        'gamma': 0.99,
-        'tau': 0.005,
+        # Core RL parameters
+        'gamma': 0.99,                 # Discount factor
+        'tau': 0.001,                  # Target network soft update rate
+        'lambda_': 0.95,               # GAE-style decay for value smoothing
+        
+        # Learning rates (tuned per optimizer)
         'actor_lr': 3e-4,
-        'critic_lr': 3e-4,
-        'alpha_lr': 3e-4,
+        'critic_lr': 2e-5,             # Slightly higher critic LR helps with stability
+        'alpha_lr': 1e-4,              # Slower entropy tuning prevents oscillations
         'entropy_lr': 3e-4,
-        'distill_lr': 3e-4,
-        'distill_coef': 0.5,
-        'buffer_size': 100000,
-        'batch_size': 256,
-        'lambda_': 0.95,
-        'target_entropy': -2,
-        'train_epochs': 5,
-        'seed_episodes': 3,
-        'max_steps': 1000000,
+        'distill_lr': 5e-4,            # Slightly higher distillation rate for fast convergence
+
+        # Distillation behavior
+        'distill_coef': 0.75,          # Stronger early distillation influence (decays over time)
+
+        # Replay buffer
+        'buffer_size': 300_000,        # Large enough to avoid old data bias, but still memory-safe
+        'batch_size': 1024,
+
+        # Entropy
+        'target_entropy': None,        # Will be dynamically learned
+
+        # Training loop controls
+        'train_epochs': 2,             # Double update per step is usually enough
+        'seed_episodes': 5,            # Initial random experience
+        'n_steps_random_exploration': 5 * 2048,  # Equals 5 full random episodes
+
+
+        # Main training loop
         'n_steps': 2048,
-        'n_steps_random_exploration': 10000,
+        'max_steps': 1_000_000,
     }),
 }

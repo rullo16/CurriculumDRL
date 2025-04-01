@@ -8,6 +8,7 @@ import wandb
 from .Nets import SACNet, EntropyTargetNet
 from .TeacherModel import TeacherModel, DistillationDataset
 from torch.utils.data import DataLoader
+from MPC_Controller import MPCController
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -20,7 +21,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #    L_KD = KL( softmax(teacher) || log_softmax(student) )
 #
 
-class DistilledSAC:
+class HybridMPC_SACAgent:
 
     def __init__(self, camera_obs_dim, vector_obs_dim, action_dims,num_agents, params):
         self.device = device
@@ -28,6 +29,8 @@ class DistilledSAC:
         self.camera_obs_dim = camera_obs_dim
         self.vector_obs_dim = vector_obs_dim
         self.action_dims = action_dims
+        self.mpc = MPCController(self)
+        self.use_mpc_until_step = int(0.1 * params.max_steps)
 
         # Initialize Networks
         self.model = SACNet(camera_obs_dim, vector_obs_dim, action_dims, num_agents).to(self.device)
@@ -37,7 +40,7 @@ class DistilledSAC:
         self.model.target_critic.eval()
         
         if self.params.target_entropy is None:
-            self.params.target_entropy = torch.tensor(-float(action_dims[0]), dtype=torch.float32).to(self.device)
+            self.params.target_entropy = -float(action_dims[0])
         self.target_entropy = self.params.target_entropy
         self.log_alpha = torch.tensor(0.0, requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=params.alpha_lr)
@@ -68,9 +71,12 @@ class DistilledSAC:
             image = image.unsqueeze(0)
         return image
     
-    def get_action(self, camera_obs, vector_obs, train=False):
+    def get_action(self, camera_obs, vector_obs,step = None, train=False):
         camera_obs = self._process_image(camera_obs)
         vector_obs = self._process_vector(vector_obs)
+
+        if step is not None and step < self.use_mpc_until_step:
+            return self.mpc.plan(camera_obs, vector_obs, step)
 
         mean, log_std = self.model(camera_obs, vector_obs)
         std = log_std.exp()
@@ -78,6 +84,7 @@ class DistilledSAC:
         z = action_distribution.rsample()
         action = torch.tanh(z)
         action = torch.round(action).clamp(-1, 1)
+
         if train: 
             log_prob = action_distribution.log_prob(z)
             log_prob -= torch.log(1 - action.pow(2) + 1e-6)
@@ -158,7 +165,7 @@ class DistilledSAC:
         step_fraction = step / self.params.max_steps
         decay_distill_coef_factor = 1 - step_fraction
         adjusted_distill_coef = self.distill_coef * decay_distill_coef_factor
-        actor_loss_l, critic_loss_l, entropy_loss_l, distill_loss_l = [], [], [], []
+        print("Training")
         for _ in range(self.params.train_epochs):
 
             sample = trajectories.sample(self.params.batch_size)
@@ -186,36 +193,31 @@ class DistilledSAC:
                     next_camera_obs, next_vector_obs, next_actions, step_fraction,target=True
                 )
 
-                q_target = torch.min(q1_target, q2_target)  # [batch_size, 1] clearly
+                q_target = torch.minimum(q1_target, q2_target,)  # [batch_size, 1] clearly
                 next_log_prob = next_dist.log_prob(next_actions).sum(-1, keepdim=True)  # [batch_size, 1]
 
                 target_q = rewards + (1 - done_flags) * self.params.gamma * (q_target - self.alpha * next_log_prob).squeeze(-1)
-                target_q = target_q.clamp(-50, 50)
+                
 
             q1, q2 = self.model.get_values(camera_obs, vector_obs, actions, step_fraction)
             q1 = q1.squeeze(-1)
-            q1 = torch.clamp(q1, -1e3, 1e3)
             q2 = q2.squeeze(-1)
-            q2 = torch.clamp(q2, -1e3, 1e3)
             critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
-            critic_loss = critic_loss.clamp(max=1e6)
+
             self.critic_optim.zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=0.5)
             self.critic_optim.step()
 
             # -----------------------------------------------------
             # Actor Training (explicitly correct)
             # -----------------------------------------------------
             new_actions, log_pi = self.get_action(camera_obs, vector_obs, train=True)
-            q1_new,q2_new = self.model.get_values(camera_obs, vector_obs, new_actions, step_fraction)
-            q_pi = torch.min(q1_new, q2_new).squeeze(-1)
+            q_pi, _ = self.model.get_values(camera_obs, vector_obs, new_actions, step_fraction)
+
             actor_loss = (self.alpha * log_pi - q_pi).mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.actor_mean.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(self.model.actor_std.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
 
             # -----------------------------------------------------
@@ -223,9 +225,9 @@ class DistilledSAC:
             # -----------------------------------------------------
             entropy_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
 
-            self.alpha_optimizer.zero_grad()
+            self.entropy_optimizer.zero_grad()
             entropy_loss.backward()
-            self.alpha_optimizer.step()
+            self.entropy_optimizer.step()
 
             self.alpha = self.log_alpha.exp().detach().cpu().item()
 
@@ -259,13 +261,15 @@ class DistilledSAC:
                 self.distill_optimizer.zero_grad()
                 distill_loss.backward()
                 self.distill_optimizer.step()
-
-            actor_loss_l.append(actor_loss.item())
-            critic_loss_l.append(critic_loss.item())
-            entropy_loss_l.append(entropy_loss.item())
-            distill_loss_l.append(distill_loss.item())
-
-        return np.mean(actor_loss_l), np.mean(critic_loss_l), np.mean(entropy_loss_l), np.mean(distill_loss_l)
+            
+                wandb.log({
+                    "actor_loss": actor_loss.item(),
+                    "critic_loss": critic_loss.item(),
+                    "entropy_loss": entropy_loss.item(),
+                    "distill_loss": distill_loss.item(),
+                    "alpha": self.alpha,
+                    "target_entropy": self.target_entropy
+                })
 
     def save(self, path):
         torch.save(self.model.state_dict(), path)
