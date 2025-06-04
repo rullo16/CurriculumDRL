@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.utils as nn_utils
+import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -16,6 +18,8 @@ def safe_xavier_initialization(module, gain=1.0):
 
 def safe_orthogonal_initialization(module, gain=nn.init.calculate_gain('relu')):
     if isinstance(module, (nn.Linear, nn.Conv2d)):
+        if isinstance(module.weight, nn.parameter.UninitializedParameter):
+            return
         if module.weight is not None:
             nn.init.orthogonal_(module.weight, gain=gain)
         if module.bias is not None:
@@ -25,111 +29,42 @@ def safe_orthogonal_initialization(module, gain=nn.init.calculate_gain('relu')):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def xavier_initialization(module, gain=1.0):
-    if isinstance(module, (nn.Linear, nn.Conv2d)):
-        if hasattr(module, 'weight') and module.weight is not None:
-            nn.init.xavier_uniform_(module.weight, gain=gain)
-        if hasattr(module, 'bias') and module.bias is not None:
-            nn.init.constant_(module.bias, 0)
-    return module
-
-def orthogonal_initialization(module, gain=nn.init.calculate_gain('relu')):
-    if isinstance(module, (nn.Linear, nn.Conv2d)):
-        if hasattr(module, 'weight') and module.weight is not None:
-            nn.init.orthogonal_(module.weight, gain=gain)
-        if hasattr(module, 'bias') and module.bias is not None:
-            nn.init.constant_(module.bias, 0)
-    return module
-
-class SkipConnectionBlock(nn.Module):
-    """
-    Residual block that applies two convolutional layers with ReLU activations,
-    then adds the input back to the output.
-    """
-    def __init__(self, channels):
-        super(SkipConnectionBlock, self).__init__()
-        self.convolutional_block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1),  # modified to preserve dimensions
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
-        )
-    
-    def forward(self, x):
-        return x + self.convolutional_block(x)
-
-class FeatureExtractionBlock(nn.Module):
-    """
-    Convolutional block for extracting features from images.
-    Consists of a convolution, pooling, ReLU, and two residual blocks.
-    """
-    def __init__(self, in_channels, out_channels):
-        super(FeatureExtractionBlock, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),  # modified kernel & stride
-            nn.MaxPool2d(kernel_size=2, stride=2),  # modified pooling
-            nn.ReLU(inplace=True),
-            SkipConnectionBlock(out_channels),
-            nn.ReLU(inplace=True),
-            SkipConnectionBlock(out_channels)
-        )
-    
-    def forward(self, x):
-        return self.layers(x)
+def _init_weights(m):
+    for name, param in m.named_parameters():
+        if 'weight_ih' in name:
+            nn.init.xavier_uniform_(param.data)
+        elif 'weight_hh' in name:
+            nn.init.orthogonal_(param.data)
+        elif 'bias' in name:
+            nn.init.constant_(param.data, 0)
 
 class FeatureExtractionNet(nn.Module):
-    """
-    Network for feature extraction that supports knowledge distillation.
-    When 'distill' is True, the output is passed through the distilled converter.
-    """
-    def __init__(self, input_shape):
-        """
-        input_shape: tuple in the format (channels, height, width)
-        """
+    def __init__(self, input_shape, distilled_dim=12800):
         super(FeatureExtractionNet, self).__init__()
-        # Build convolutional pipeline with feature extraction blocks
         self.convolutional_pipeline = nn.Sequential(
-            FeatureExtractionBlock(input_shape[0], 32),
-            FeatureExtractionBlock(32, 64),
-            FeatureExtractionBlock(64, 128),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4, padding=2), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1), nn.ReLU(),
             nn.Flatten(),
-            nn.Dropout(0.5)
         )
-        # Apply initialization to the conv pipeline and converter
-        self.distilled_converter = nn.Linear(12800, 256) #HARDCODED MODIFY TO MAKE DYANMIC
 
-        self.convolutional_pipeline.apply(xavier_initialization)
-    
+        dummy = torch.zeros(1, *input_shape)
+        conv_out = self.convolutional_pipeline(dummy).view(1, -1).shape[1]
+        self.distilled_converter = nn.Linear(conv_out, distilled_dim)
+        self.dropout = nn.Dropout(0.5)
+
+        self.convolutional_pipeline.apply(safe_xavier_initialization)
+
     def forward(self, x, distill=False):
-        """
-        Forward pass.
-        Normalizes input and processes through the conv pipeline.
-        If 'distill' is True, converts conv features to a distilled representation.
-        """
-        # Ensure data is float, normalized if coming in as bytes, and sent to the same device as the model
-        normalized_x = (x.float() / 255.0)
-        conv_out = self.convolutional_pipeline(normalized_x).view(normalized_x.size(0), -1)
+        x = x.float()
+        if x.max() > 1.01:
+            x.div(255.0)  # Normalize input to [0, 1]
+        conv_out = self.convolutional_pipeline(x).view(x.size(0), -1)
         if distill:
+            conv_out = self.dropout(conv_out)
             return self.distilled_converter(conv_out)
         return conv_out
-    
-# class AttentionMudule(nn.Module):
-    # def __init__(self,input_shape):
-    #     super(AttentionMudule, self).__init__()
-    #     self.query = nn.Linear(input_shape, 258)
-    #     self.key = nn.Linear(input_shape, 258)
-    #     self.value = nn.Linear(input_shape, 258)
-    #     self.scale = torch.sqrt(torch.tensor([258])).to(device)
 
-    # def forward(self, x):
-    #     queries = self.query(x)
-    #     keys = self.key(x)
-    #     values = self.value(x)
-
-    #     attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / self.scale
-    #     attention_weights = F.softmax(attention_scores, dim=-1)
-    #     attended_values = torch.matmul(attention_weights, values)
-    #     return attended_values
 
 class SparseAttention(nn.Module):
     def __init__(self, input_dim, head_dim=64):
@@ -140,17 +75,15 @@ class SparseAttention(nn.Module):
         self.scale = np.sqrt(head_dim)
 
     def forward(self, x):
-        Q = self.query(x)  # [batch_size, head_dim]
-        K = self.key(x)    # [batch_size, head_dim]
-        V = self.value(x)  # [batch_size, head_dim]
+        x_seq = x.unsqueeze(1)  
+        Q = self.query(x_seq)  # [batch_size, head_dim]
+        K = self.key(x_seq)    # [batch_size, head_dim]
+        V = self.value(x_seq)  # [batch_size, head_dim]
 
-        attn_scores = (Q @ K.T) / self.scale  # [batch_size, batch_size]
-        attention_weights = F.softmax(attn_scores, dim=-1)  # [batch_size, batch_size]
-
-        # explicitly correct operation to get correct shape:
-        attended_output = attention_weights @ V  # [batch_size, head_dim]
-
-        return attended_output  # explicitly correct shape
+        scores = torch.matmul(Q, K.transpose(-2,-1))/self.scale
+        weights = F.softmax(scores, dim=-1)  
+        attended = torch.matmul(weights, V)
+        return attended.squeeze(1)  
 
 
 class AdaptiveAttention(nn.Module):
@@ -188,6 +121,18 @@ class AdaptiveAttention(nn.Module):
         final_attention = self.output_layer(combined_attention)  # [batch_size, input_dim]
 
         return final_attention  # [batch_size, input_dim]
+    
+class AdaptiveGating(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(1,32), nn.ReLU(),
+            nn.Linear(32, dim), nn.Sigmoid()
+        )
+    def forward(self, x, step_fraction):
+        step_fraction = torch.as_tensor(step_fraction, device=x.device, dtype=x.dtype)
+        gate = self.fc(step_fraction.expand(1,1))
+        return x * gate  # Element-wise multiplication
 
 class EntropyTargetNet(nn.Module):
     def __init__(self):
@@ -203,72 +148,144 @@ class EntropyTargetNet(nn.Module):
         return -2.0 * self.fc(x)
 
 class CriticNet(nn.Module):
-    def __init__(self, action_dim, hidden_dim=256):
+    def __init__(self, input_dim,hidden_dim=256):
         super(CriticNet, self).__init__()
-        self.q1 = nn.Sequential(
-            nn.Linear(action_dim + hidden_dim, 128),
+        
+
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 64),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 1)
         )
-        self.q1.apply(xavier_initialization)
+
+        mid = hidden_dim // 2
+        self.q1 = nn.Sequential(
+            nn.Linear(hidden_dim, mid),
+            nn.LayerNorm(mid),
+            nn.ReLU(inplace=True),
+            nn_utils.spectral_norm(nn.Linear(mid, 1))
+        )
 
         self.q2 = nn.Sequential(
-            nn.Linear(action_dim + hidden_dim, 128),
+            nn.Linear(hidden_dim, mid),
+            nn.LayerNorm(mid),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1)
+            nn_utils.spectral_norm(nn.Linear(mid, 1))
         )
-        self.q2.apply(xavier_initialization)
-    
+
+
+        self.q1.apply(safe_xavier_initialization)
+        self.q2.apply(safe_xavier_initialization)
+        
     def forward(self, x):
+        x = self.backbone(x)
         return self.q1(x), self.q2(x)
     
+class CentralizedCriticNet(nn.Module):
+    def __init__(self, per_agent_dim, action_dim, num_agents):
+        super().__init__()
+        self.num_agents = num_agents
+        in_dim = num_agents * (per_agent_dim + action_dim)
+        
+        self.backbone = nn.Sequential(
+            nn.LazyLinear(512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+        )
+
+        self.q_heads = nn.ModuleList(
+            [nn.Linear(256,1) for _ in range(num_agents)]
+        )
+
+        self.apply(safe_orthogonal_initialization)
+
+    def forward(self, feats, actions):
+        x = torch.cat([feats, actions], dim=-1)
+        x = x.reshape(x.size(0), -1)
+        h = self.backbone(x)
+        qs = torch.cat([head(h) for head in self.q_heads], dim=1)
+        return qs
+    
+class GaussianPolicy(nn.Module):
+    def __init__(self, input_dim, act_dim):
+        super().__init__()
+        self.mu = nn.Linear(input_dim, act_dim)
+        self.log_std = nn.Linear(input_dim, act_dim)
+
+    def forward(self, x):
+        mu = self.mu(x)
+        log_std = torch.clamp(self.log_std(x), -5.0, 1.5)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mu, std)
+        return dist
+    
 class SACNet(nn.Module):
-    def __init__(self, camera_obs_dim, vector_obs_dim, n_actions, num_agents):
+    def __init__(self, camera_obs_dim, vector_obs_dim, n_actions):
         super(SACNet, self).__init__()
         self.camera_obs_dim = camera_obs_dim
         self.vector_obs_dim = vector_obs_dim
-        self.n_actions = n_actions if isinstance(n_actions, (list, tuple)) else [n_actions]
         self.convolution_pipeline = FeatureExtractionNet(camera_obs_dim)
         self.conv_out_size = self._get_conv_out(camera_obs_dim)
+        self.feat_dim = 128
+        self.n_actions = n_actions
+        self.vector_processor = nn.Sequential(
+            nn.LayerNorm(vector_obs_dim[0]),
+            nn.Linear(vector_obs_dim[0], 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 64),
+            nn.ReLU(inplace=True),
+        )
+
+
+        # self.rnn = nn.GRU(
+        #     input_size=self.conv_out_size+64,
+        #     hidden_size=512, num_layers=2,
+        #     batch_first=True, dropout=0.2
+        # )
+
+        # self.rnn_lr = nn.LayerNorm(512)
+
+        self.backbone = nn.Sequential(
+            nn.LazyLinear(512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+        )
+
         self.fully_connected_pipeline = nn.Sequential(
-            nn.Linear(self.conv_out_size + self.vector_obs_dim[0], 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 512),
-            nn.ReLU(inplace=True),
             nn.Linear(512, 256),
-            nn.ReLU(inplace=True)
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
         )
         
-        self.actor_mean = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, self.n_actions[0]),
-            nn.Tanh()
-        )
+        self.policy_head = GaussianPolicy(128, self.n_actions)
 
-        self.actor_std = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, self.n_actions[0]),
-            nn.Softplus()
-        )
+        input_dim = 128 + self.n_actions
 
-        self.attention = AdaptiveAttention(256 + self.n_actions[0])
+        self.gating = AdaptiveGating(input_dim)
+        self.critic = CriticNet(input_dim)
+        self.target_critic = CriticNet(input_dim)
 
-        self.critic = CriticNet(self.n_actions[0], 256)
 
-        self.target_critic = CriticNet(self.n_actions[0], 256)
+        self.fully_connected_pipeline.apply(safe_xavier_initialization)
+        self.policy_head.apply(safe_xavier_initialization)
 
-        self.fully_connected_pipeline.apply(xavier_initialization)
-        self.actor_mean.apply(xavier_initialization)
-        self.actor_std.apply(xavier_initialization)
+    def dist_from_feats(self, feats):
+        return self.policy_head(feats)
 
     def _get_conv_out(self, shape):
-        self.convolution_pipeline.eval()
         with torch.no_grad():
             dummy_input = torch.zeros(1, *shape)
             output = self.convolution_pipeline(dummy_input)
@@ -276,32 +293,34 @@ class SACNet(nn.Module):
         return int(np.prod(output.size()[1:]))
     
     def forward(self, camera_obs, vector_obs):
-        if vector_obs.ndim == 1:
-            vector_obs = vector_obs.unsqueeze(0)
-        fc_input = torch.cat([self.convolution_pipeline(camera_obs), vector_obs], dim=1)  # modified to ensure same dimensions
-        fc_out = self.fully_connected_pipeline(fc_input)
-        action_mean = self.actor_mean(fc_out)
-        action_log_std = self.actor_std(fc_out)
-        action_log_std = torch.clamp(action_log_std, -20, 2)
-        return action_mean, action_log_std
+        vec_feat = self.vector_processor(vector_obs)  # [batch_size, 128]
+        fc_input = torch.cat([self.convolution_pipeline(camera_obs), vec_feat], dim=1)  # modified to ensure same dimensions
+        rnn_out = self.backbone(fc_input)  # [batch_size, 512]
+        fc_out = self.fully_connected_pipeline(rnn_out)
+        logits = self.policy_head(fc_out)  # [batch_size, n_actions]
+        return logits
+    
+    def encode(self, camera_obs, vector_obs):
+        cam = self.convolution_pipeline(camera_obs)  # [batch_size, conv_dim]
+        vec_feat = self.vector_processor(vector_obs)  # [batch_size, 128]
+        feats = self.backbone(torch.cat([cam, vec_feat], dim=1))  # [batch_size, 512]
+        feats = self.fully_connected_pipeline(feats)
+        return feats
     
     def get_values(self, camera_obs, vector_obs, actions, step_fraction, target=False):
         if vector_obs.dim() == 1:
             vector_obs = vector_obs.unsqueeze(0)
         if actions.dim() == 1:
             actions = actions.unsqueeze(0)
-
         conv_out = self.convolution_pipeline(camera_obs)  # [batch_size, conv_dim]
-        fc_input = torch.cat([conv_out, vector_obs], dim=1).to(device)
-        fc_out = self.fully_connected_pipeline(fc_input)
-
-        critic_input = torch.cat([fc_out, actions], dim=1).to(device)
+        vec_feat = self.vector_processor(vector_obs)
+        fc_input = torch.cat([conv_out, vec_feat], dim=1).to(device)
+        fc_out = self.backbone(fc_input)  # [batch_size, 512]
+        fc_out = self.fully_connected_pipeline(fc_out)  # [batch_size, 128]
+        critic_input = torch.cat([fc_out, actions], dim=1)
 
         # explicitly correct attention layer output shape
-        critic_input = self.attention(critic_input, step_fraction)  # explicitly [batch_size, hidden_dim]
-
-        if critic_input.dim() != 2:
-            critic_input = critic_input.view(critic_input.size(0), -1)
+        # critic_input = self.gating(critic_input, step_fraction)  # explicitly [batch_size, hidden_dim]
 
         # clearly defined critics returning [batch_size, 1]
         if target:
