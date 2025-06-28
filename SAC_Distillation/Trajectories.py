@@ -1,7 +1,11 @@
 import numpy as np
 
 
-
+def _norm_reward(r,d,mean, std):
+    r = r.copy()
+    idx = (d == 0.0)
+    r[idx] = (r[idx] - mean) / (std + 1e-8)
+    return r
 
 class RunningStat:
     def __init__(self, shape, eps=1e-4):
@@ -78,6 +82,9 @@ class SAC_ExperienceBuffer:
         self.vector_obs[idx] = vector_obs
         self.actions[idx] = action
         self.dones[idx] = done
+
+        reward = np.clip(reward, -5.0, 50.0)
+        self.reward_stat.update(reward)
         self.rewards[idx] = reward
         
         self.next_camera_obs[idx] = next_camera_obs
@@ -87,7 +94,6 @@ class SAC_ExperienceBuffer:
 
         self.camera_stat.update(camera_obs)
         self.vector_stat.update(vector_obs)
-        self.reward_stat.update(reward)
 
         self.ptr = (self.ptr + 1) % self.buffer_size
         self.size = min(self.size + 1, self.buffer_size)
@@ -111,12 +117,15 @@ class SAC_ExperienceBuffer:
         batch_idxs = np.random.choice(self.size, batch_size, replace=self.size < batch_size, p=probs)
         k = np.arange(n_step, dtype=np.int32)
         idxs_k = np.minimum(batch_idxs[:, None] + k, self.size - 1)
-        norm_r = lambda x: (x - self.reward_stat.mean) / (self.reward_stat.std + 1e-8)
-        r_k = norm_r(self.rewards[idxs_k])
+
+        r_k = self.rewards[idxs_k]
         d_k = self.dones[idxs_k]
+
         discounts = (self.gamma ** k).astype(np.float32)
         mask = np.cumprod(1.0 - d_k, axis=1, dtype=np.float32)
+        mask[:, 0] = 1.0  # Ensure the first step is always included in the mask
         nstep_returns = (r_k * discounts * mask).sum(axis=1, keepdims=True)
+
         idx_n = np.minimum(batch_idxs + n_step, self.size - 1)
         
         weights = (self.size * probs[batch_idxs])**(-beta)
@@ -129,12 +138,14 @@ class SAC_ExperienceBuffer:
             camera_obs = norm_cam(self.camera_obs[batch_idxs]),
             vector_obs = norm_vec(self.vector_obs[batch_idxs]),
             actions = self.actions[batch_idxs],
-            rewards = norm_r(self.rewards[batch_idxs, None]),
+            # rewards = _norm_reward(self.rewards[batch_idxs,None], self.dones[batch_idxs,None], self.reward_stat.mean, self.reward_stat.std),
+            rewards = self.rewards[batch_idxs, None],
             next_camera_obs = norm_cam(self.next_camera_obs[batch_idxs]),
             next_vector_obs = norm_vec(self.next_vector_obs[batch_idxs]),
             dones = self.dones[batch_idxs, None],
             indices = batch_idxs,
             weights = weights,
+            # nstep_returns = _norm_reward(nstep_returns, d_k[:,0:1], self.reward_stat.mean, self.reward_stat.std),
             nstep_returns = nstep_returns,
             nstep_next_idxs = idx_n
         )
@@ -164,13 +175,24 @@ class SAC_ExperienceBuffer:
         k = np.arange(n_step, dtype=np.int32)
         idxs_k = np.minimum(idx_flat[:, None] + k, self.size - 1)
 
-        norm_r = lambda x: (x - self.reward_stat.mean) / (self.reward_stat.std + 1e-8)
-        r_k = norm_r(self.rewards[idxs_k])
+        # norm_r = lambda x: (x - self.reward_stat.mean) / (self.reward_stat.std + 1e-8)
+        # r_k = norm_r(self.rewards[idxs_k])
+        # d_k = self.dones[idxs_k]
+
+        # disconts = (self.gamma ** k).astype(np.float32)
+        # mask = np.cumprod(1.0-d_k, axis=1, dtype=np.float32)
+        # mask[:, 0] = 1.0  # Ensure the first step is always included in the mask
+        # first_step = (d_k[:,0:1] == 1.0).astype(np.float32)
+        # nstep_ret = first_step + r_k[:, 0:1] + (1-first_step) * (r_k * disconts * mask).sum(axis=1, keepdims=True)
+        r_k = self.rewards[idxs_k]
         d_k = self.dones[idxs_k]
 
         disconts = (self.gamma ** k).astype(np.float32)
-        mask = np.cumprod(1.0-d_k, axis=1, dtype=np.float32)
-        nstep_ret = (r_k * disconts * mask).sum(axis=1, keepdims=True)
+
+        mask = np.cumprod(1.0 - d_k, axis=1, dtype=np.float32)
+        mask[:, 0] = 1.0  # Ensure the first step is always included in the mask
+
+        n_step_ret = (r_k * disconts * mask).sum(axis=1, keepdims=True)
 
         idx_n_flat = np.minimum(idx_flat + n_step, self.size - 1)
 
@@ -183,21 +205,23 @@ class SAC_ExperienceBuffer:
             camera_obs = norm_cam(self.camera_obs[idx_flat]).reshape(batch_size, num_agents, *self.camera_obs.shape[1:]),
             vector_obs = norm_vec(self.vector_obs[idx_flat]).reshape(batch_size, num_agents, -1),
             actions = self.actions[idx_flat].reshape(batch_size, num_agents, -1),
-            rewards = norm_r(self.rewards[idx_flat]).reshape(batch_size, num_agents, 1),
+            # rewards = _norm_reward(self.rewards[idx_flat], self.dones[idx_flat], self.reward_stat.mean,self.reward_stat.std).reshape(batch_size, num_agents, 1),
+            rewards = self.rewards[idx_flat].reshape(batch_size, num_agents, 1),
             next_camera_obs = norm_cam(self.next_camera_obs[idx_flat]).reshape(batch_size, num_agents, *self.camera_obs.shape[1:]),
             next_vector_obs = norm_vec(self.next_vector_obs[idx_flat]).reshape(batch_size, num_agents, -1),
             dones = self.dones[idx_flat].reshape(batch_size, num_agents, 1),
             indices = idx_flat.reshape(batch_size, num_agents),
-            weights = weights.astype(np.float32)[:, None],  # Ensure weights is 2D
-            nstep_returns = norm_r(nstep_ret).reshape(batch_size, num_agents, 1),
+            weights = weights.astype(np.float32),  # Ensure weights is 2D
+            # nstep_returns = _norm_reward(n_step_ret, d_k[:,:1], self.reward_stat.mean, self.reward_stat.std).reshape(batch_size, num_agents, 1),
+            nstep_returns = n_step_ret.reshape(batch_size, num_agents, 1),
             nstep_next_idxs = idx_n_flat.reshape(batch_size, num_agents),
         )
 
         return batch
     
     def update_priorities(self, indices, priorities):
-        assert len(indices) == len(priorities), "Indices and priorities must have the same length."
-        self.priorities[np.asarray(indices, dtype=np.int64)] = priorities
+        assert indices.shape[0] == priorities.shape[0], "Indices and priorities must have the same length."
+        self.priorities[indices] = priorities.astype(np.float32)
 
     def __len__(self):
         return self.size

@@ -39,7 +39,7 @@ def _init_weights(m):
             nn.init.constant_(param.data, 0)
 
 class FeatureExtractionNet(nn.Module):
-    def __init__(self, input_shape, distilled_dim=12800):
+    def __init__(self, input_shape, distilled_dim=2048):
         super(FeatureExtractionNet, self).__init__()
         self.convolutional_pipeline = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4, padding=2), nn.ReLU(),
@@ -184,14 +184,47 @@ class CriticNet(nn.Module):
         x = self.backbone(x)
         return self.q1(x), self.q2(x)
     
+
+class ICM(nn.Module):
+    def __init__(self, feature_dim, action_dim, hidden_dim=256):
+        super().__init__()
+        self.inverse_model = nn.Sequential(
+            nn.Linear(feature_dim*2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+        self.forward_model = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim),
+        )
+
+        self.apply(safe_orthogonal_initialization)
+
+    def forward(self, state_feat, next_state_feat, action):
+        predicted_next_feat = self.forward_model(torch.cat([state_feat, action], dim=-1))
+        intrinsic_reward = F.mse_loss(predicted_next_feat, next_state_feat.detach(), reduction='none').mean(dim=-1, keepdim=True)
+
+        forward_loss = F.mse_loss(predicted_next_feat, next_state_feat.detach())
+
+        predicted_action = self.inverse_model(torch.cat([state_feat, next_state_feat], dim=-1))
+        inverse_loss = F.mse_loss(predicted_action, action.detach())
+
+        return intrinsic_reward, forward_loss, inverse_loss
+    
 class CentralizedCriticNet(nn.Module):
     def __init__(self, per_agent_dim, action_dim, num_agents):
         super().__init__()
         self.num_agents = num_agents
-        in_dim = num_agents * (per_agent_dim + action_dim)
+        self.per_agent_dim = per_agent_dim
+        self.action_dim = action_dim
+
+
+        centralized_input_dim = num_agents * (per_agent_dim + action_dim)
         
         self.backbone = nn.Sequential(
-            nn.LazyLinear(512),
+            nn.Linear(centralized_input_dim,512),
             nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Linear(512, 256),
@@ -206,9 +239,11 @@ class CentralizedCriticNet(nn.Module):
         self.apply(safe_orthogonal_initialization)
 
     def forward(self, feats, actions):
-        x = torch.cat([feats, actions], dim=-1)
-        x = x.reshape(x.size(0), -1)
-        h = self.backbone(x)
+        batch_size = feats.shape[0] // self.num_agents
+
+        x_per_agent = torch.cat([feats, actions], dim=-1)
+        x_centralized = x_per_agent.view(batch_size, -1)
+        h = self.backbone(x_centralized)
         qs = torch.cat([head(h) for head in self.q_heads], dim=1)
         return qs
     
@@ -230,15 +265,15 @@ class SACNet(nn.Module):
         super(SACNet, self).__init__()
         self.camera_obs_dim = camera_obs_dim
         self.vector_obs_dim = vector_obs_dim
-        self.convolution_pipeline = FeatureExtractionNet(camera_obs_dim)
+        self.convolution_pipeline = FeatureExtractionNet(camera_obs_dim, distilled_dim=12800)
         self.conv_out_size = self._get_conv_out(camera_obs_dim)
-        self.feat_dim = 128
+        self.feat_dim = 256
         self.n_actions = n_actions
         self.vector_processor = nn.Sequential(
             nn.LayerNorm(vector_obs_dim[0]),
-            nn.Linear(vector_obs_dim[0], 64),
+            nn.Linear(vector_obs_dim[0], 128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
             nn.ReLU(inplace=True),
         )
 
@@ -252,31 +287,27 @@ class SACNet(nn.Module):
         # self.rnn_lr = nn.LayerNorm(512)
 
         self.backbone = nn.Sequential(
-            nn.LazyLinear(512),
-            nn.LayerNorm(512),
+            nn.LazyLinear(256),
+            nn.LayerNorm(256),
             nn.ReLU(inplace=True),
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
             nn.ReLU(inplace=True),
         )
 
         self.fully_connected_pipeline = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(256, 256),
             nn.LayerNorm(256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
         )
-        
-        self.policy_head = GaussianPolicy(128, self.n_actions)
+
+        self.policy_head = GaussianPolicy(256, self.n_actions)
 
         input_dim = 128 + self.n_actions
-
-        self.gating = AdaptiveGating(input_dim)
-        self.critic = CriticNet(input_dim)
-        self.target_critic = CriticNet(input_dim)
 
 
         self.fully_connected_pipeline.apply(safe_xavier_initialization)
@@ -306,23 +337,3 @@ class SACNet(nn.Module):
         feats = self.backbone(torch.cat([cam, vec_feat], dim=1))  # [batch_size, 512]
         feats = self.fully_connected_pipeline(feats)
         return feats
-    
-    def get_values(self, camera_obs, vector_obs, actions, step_fraction, target=False):
-        if vector_obs.dim() == 1:
-            vector_obs = vector_obs.unsqueeze(0)
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(0)
-        conv_out = self.convolution_pipeline(camera_obs)  # [batch_size, conv_dim]
-        vec_feat = self.vector_processor(vector_obs)
-        fc_input = torch.cat([conv_out, vec_feat], dim=1).to(device)
-        fc_out = self.backbone(fc_input)  # [batch_size, 512]
-        fc_out = self.fully_connected_pipeline(fc_out)  # [batch_size, 128]
-        critic_input = torch.cat([fc_out, actions], dim=1)
-
-        # explicitly correct attention layer output shape
-        # critic_input = self.gating(critic_input, step_fraction)  # explicitly [batch_size, hidden_dim]
-
-        # clearly defined critics returning [batch_size, 1]
-        if target:
-            return self.target_critic(critic_input)
-        return self.critic(critic_input)

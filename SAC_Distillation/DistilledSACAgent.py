@@ -6,8 +6,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as distributions
 import wandb
-from .Nets import SACNet, EntropyTargetNet, CentralizedCriticNet
-from .TeacherModel import TeacherModel, DistillationDataset, TeacherStudentPairs
+from .Nets import SACNet, CentralizedCriticNet, ICM
+from .VipTeacher import VipTeacher
+from .TeacherModel import DistillationDataset, TeacherStudentPairs
 from torch.utils.data import DataLoader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,8 +64,8 @@ class DistilledSAC:
         self.vector_obs_dim = vector_obs_dim
         self.action_dims = action_dims[0]
         self.critic_lr = params.get('critic_lr', 3e-4)
-        self.actor_lr = params.get('actor_lr', 2e-4)
-        self.alpha_lr = params.get('alpha_lr', 3e-5)
+        self.actor_lr = params.get('actor_lr', 1e-4)
+        self.alpha_lr = params.get('alpha_lr', 1e-5)
         self.max_steps = params.get('max_steps', 5_000_000)
         self.distill_lr = params.get('distill_lr', 3e-5)
         self.policy_delay = params.get('policy_delay', 2)
@@ -74,9 +75,9 @@ class DistilledSAC:
         self.critic_updates = params.get('critic_updates', 3)
         self.actor_updates = params.get('actor_updates', 1)
         self.distill_coef = params.get('distill_coef', 0.06)
-        self.init_noise = 1.0
+        self.init_noise = 0.4
         self.final_noise = 0.05
-        self.noise_decay = 1.0
+        self.noise_decay = 0.3
 
         # Initialize Networks
         self.model = SACNet(camera_obs_dim, vector_obs_dim, self.action_dims).to(self.device)
@@ -87,6 +88,11 @@ class DistilledSAC:
 
         feat_dim = self.model.feat_dim
         self.ccritic = CentralizedCriticNet(feat_dim, self.action_dims, num_agents).to(self.device)
+
+        self.icm = ICM(feat_dim, self.action_dims).to(self.device)
+        self.icm_optimizer = optim.AdamW(self.icm.parameters(), lr=1e-4)
+        self.curiosity_coef = params.get('curiosity_coef', 0.01)
+
         self.ccritic_tgt = copy.deepcopy(self.ccritic).to(self.device)
         self.actor_optimizer = optim.AdamW(self.model.parameters(), lr=self.actor_lr, weight_decay=1e-4)
         self.critic_optim = optim.AdamW(self.ccritic.parameters(), lr=self.critic_lr, weight_decay=1e-4)
@@ -95,16 +101,16 @@ class DistilledSAC:
         self.ccritic_tgt.eval()
 
         self.target_entropy = -float(self.action_dims)
-        self.log_alpha = torch.tensor(0.0, requires_grad=True, device=self.device)
+        self.log_alpha = torch.tensor(np.log(0.2), requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=self.alpha_lr)
 
         self._distill_dataset = None
         self._distill_loader = None
 
-        self.min_target_entropy = -float(self.action_dims)*1.5
+        self.min_target_entropy = -float(self.action_dims)
 
         #Teacher and student networks
-        self.teacher = TeacherModel().to(self.device)
+        self.teacher = VipTeacher().to(self.device)
         self.teacher.eval()
         self.distill_optimizer = optim.Adam(self.model.convolution_pipeline.parameters(), lr=self.distill_lr)
         
@@ -124,50 +130,31 @@ class DistilledSAC:
     def _sample(dist):
         z = dist.rsample()
         action = torch.tanh(z)
-        log_pi = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_pi = (dist.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)).sum(dim=-1, keepdim=True)
         return action, log_pi.sum(dim=-1, keepdim=True)
     
-    def get_action(self, camera_obs, vector_obs, train=False, add_noise=False, step_fraction=None):
+    def get_action(self, camera_obs, vector_obs, train=False):
         camera_obs = _process_image(camera_obs)
         vector_obs = _process_vector(vector_obs)
 
         feats = self.model.encode(camera_obs, vector_obs)
         dist = self.model.dist_from_feats(feats)
         action, log_prob = self._sample(dist)
-
-        if add_noise and not train:
-            frac = step_fraction if step_fraction is not None else 1.0
-            sigma = cosine_sigma(self.init_noise, self.final_noise, frac)
-            action = (action + torch.randn_like(action) * sigma).clamp(-1.0, 1.0)
+        # if add_noise and not train:
+        #     frac = step_fraction if step_fraction is not None else 1.0
+        #     sigma = cosine_sigma(self.init_noise, self.final_noise, frac)
+        #     action = (action + torch.randn_like(action) * sigma).clamp(-1.0, 1.0)
         if train:
             return action, log_prob
         return action
     
-    def act(self, cam, vec, step):
-        eps_init, eps_final = self.init_noise, self.final_noise
-        eps = max(eps_final, eps_init * (1.0 - step / self.max_steps))
-
-        if np.random.rand() < eps:
-            # Return a random action for each agent
-            if isinstance(cam, torch.Tensor):
-                num_agents = cam.shape[0]
-            else:
-                num_agents = len(cam)
-            return torch.from_numpy(np.random.uniform(-1, 1, (num_agents, self.action_dims))).float().to(self.device)
-        
-        frac = 1.0 - np.exp(-step / self.max_steps)
-        a = self.get_action(cam, vec, train=False, add_noise=True, step_fraction=frac)
+    def act(self, cam, vec):
+        a = self.get_action(cam, vec, train=False)
         return a
     
-    def get_values(self, camera_obs, vector_obs, action, step_fraction, target=False):
-        camera_obs = self._process_image(camera_obs)
-        vector_obs = self._process_vector(vector_obs)
-        action = self._process_vector(action)
-        value_1, value_2 = self.model.get_values(camera_obs, vector_obs, action, step_fraction, target=target)
-        return value_1, value_2
-    
     def _exploration_noise(self, step_fraction):
-        return cosine_sigma(self.init_noise, self.final_noise, step_fraction)
+        frac = min(step_fraction / self.noise_decay, 1.0)
+        return cosine_sigma(self.init_noise, self.final_noise, frac)
 
     def _get_teacher_output(self, camera_obs):
         with torch.no_grad():
@@ -222,10 +209,11 @@ class DistilledSAC:
             batch_teach, emb_list = 128, []
             for i in range(0, len(cams), batch_teach):
                 imgs = cams[i:i+batch_teach]
-                imgs = imgs.mean(dim=1, keepdim=True)  # Convert to grayscale if needed
-                imgs = imgs.repeat(1, 3, 1, 1)  # Repeat to match expected input shape for teacher
-                img_ts = torch.as_tensor(imgs, device=device, dtype=torch.float16)
-                emb = self.teacher(img_ts, no_grad=True).float().cpu()
+                if imgs.ndim == 3:
+                    imgs = imgs.unsqueeze(0)  # Ensure batch dimension
+                else:
+                    imgs = imgs.permute(0, 3, 1, 2)  # Convert to (B, C, H, W)
+                emb = self.teacher(imgs.to(device)).float().cpu()
                 emb_list.append(emb)
                 del imgs, emb
                 torch.cuda.empty_cache()
@@ -299,10 +287,8 @@ class DistilledSAC:
 
         beta = 0.4 + step_fraction * 0.6
 
-        if step_fraction < 0.1:
-            curr_policy_delay = max(self.policy_delay, 4)
-        else:
-            curr_policy_delay = self.policy_delay
+        
+        curr_policy_delay = self.policy_delay
             
         tau_min, tau_max = 0.002, 0.01
         curr_tau = tau_min + step_fraction * (tau_max - tau_min)
@@ -320,6 +306,21 @@ class DistilledSAC:
             done_flags = _process_vector(sample["dones"])
             next_camera_obs = _process_image(sample["next_camera_obs"])
             next_vector_obs = _process_vector(sample["next_vector_obs"])
+            weights = sample["weights"]
+            weights = torch.as_tensor(sample["weights"],
+                          device=self.device,
+                          dtype=torch.float32)       # (B, N, 1)  or (B,1)
+
+            if weights.ndim > 2:                                # came from sample_joint
+                B, N, _ = weights.shape
+                # This is still needed for the actor loss later, which expects a flattened tensor
+                weights_flat   = weights.view(B * N, 1)         # Shape: (4096, 1)
+
+                # Squeeze the last dimension of the original weights tensor to get the correct shape
+                weights_critic = weights.squeeze(-1)            # Shape: (1024, 4)
+            else:                                               # single-agent sample
+                weights_flat   = weights                        
+                weights_critic = weights.squeeze(-1) # Also squeeze here for consistency
 
             if camera_obs.dim() > 4:
                 B,N = camera_obs.shape[:2]
@@ -332,6 +333,21 @@ class DistilledSAC:
             if actions.dim() > 2:
                 B,N = actions.shape[:2]
                 actions = actions.view(B*N, -1)
+
+            with torch.no_grad():
+                feats_next = self._encode(next_camera_obs, next_vector_obs)
+            feats_now = self._encode(camera_obs, vector_obs)
+
+            self.icm_optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
+                intrinsic_rewards, fwd_loss, inv_loss = self.icm(feats_now.detach(), feats_next.detach(), actions)
+                icm_loss = (0.8 * fwd_loss) + (0.2 * inv_loss)
+
+            self.scaler.scale(icm_loss).backward(retain_graph=True)
+            self.scaler.unscale_(self.icm_optimizer)
+            
+
+
             # --- Critic Training ---
 
             with torch.no_grad():
@@ -341,22 +357,26 @@ class DistilledSAC:
                 eps = torch.randn_like(next_action) * sigma
                 next_action = (next_action + eps).clamp(-1.0, 1.0)
 
-                feats_next = self._encode(next_camera_obs, next_vector_obs)
                 q_next = self.ccritic_tgt(feats_next, next_action)
 
-                r_env = rewards.view(-1, 1)
-                done_env = done_flags.view(-1, 1).float()
+                r_env = rewards.view(-1,1)
+                done_env = done_flags.view(-1,1).float()
 
-                td_target = r_env + (1.0 - done_env) * self.gamma * q_next
-                # td_target = td_target.clamp(-5.0, 5.0)
+                decay_factor = max(0.0, 1.0 - step_fraction)
+                self.current_curiosity_coef = self.curiosity_coef * decay_factor
+
+                total_reward = r_env + self.current_curiosity_coef * intrinsic_rewards.detach()
+                total_reward_reshaped = total_reward.view(B,N)
+                done_reshaped = done_env.view(B,N)
+
+                td_target = total_reward_reshaped + (1.0 - done_reshaped) * self.gamma * q_next
             
             for _ in range(self.critic_updates):
                 self.critic_optim.zero_grad(set_to_none=True)
                 self.critic_head_optim.zero_grad(set_to_none=True)
                 with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
-                    feats_now = self._encode(camera_obs, vector_obs)
-                    q_pred = self.ccritic(feats_now, actions)
-                    critic_loss = F.smooth_l1_loss(q_pred, td_target)
+                    q_pred = self.ccritic(feats_now.detach(), actions)
+                    critic_loss = (weights_critic * F.huber_loss(q_pred, td_target, delta=10.0, reduction='none')).mean()
 
                 self.scaler.scale(critic_loss).backward()
                 self.scaler.unscale_(self.critic_optim)
@@ -384,9 +404,10 @@ class DistilledSAC:
                     self.actor_optimizer.zero_grad(set_to_none=True)
                     with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
                         new_a, logp = self.get_action(camera_obs, vector_obs, train=True)
-                        q_new = self.ccritic(self._encode(camera_obs, vector_obs), new_a)
+                        q_new = self.ccritic(feats_now, new_a)
                         q_new_min = q_new.min(dim=1, keepdim=True).values
-                        actor_loss = (self.log_alpha.exp().detach() * logp.squeeze(-1)-q_new_min).mean()
+                        q_new_min_exp = q_new_min.repeat(1,N).view(B*N,1)
+                        actor_loss = (weights_flat *(self.log_alpha.exp().detach()*logp-q_new_min_exp)).mean()
                         actor_loss_l.append(actor_loss.item())
 
                     self.scaler.scale(actor_loss).backward()
@@ -398,7 +419,8 @@ class DistilledSAC:
                 
                 
                 # # --- Entropy Regularization ---
-                entropy_loss = -(self.log_alpha * (logp + self.target_entropy).detach()).mean()
+                entropy_err = (logp + self.target_entropy).detach()
+                entropy_loss = -(weights_flat * self.log_alpha * entropy_err).mean()
 
                 self.alpha_optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(entropy_loss).backward()
@@ -408,19 +430,26 @@ class DistilledSAC:
                 with torch.no_grad():
                     self.log_alpha.clamp_(min=np.log(1e-5), max=np.log(1e2))
             
-            td_env = (q_pred - td_target).abs().max(dim=1).values
-            priorities = td_env.detach().cpu().abs().numpy().reshape(-1)
-            priorities = priorities / (priorities.max()+ 1e-6) + 1e-3
+            td_err = (q_pred - td_target).abs()
+            td_err_per_env = td_err.max(dim=1).values
+            priorities = td_err_per_env.repeat_interleave(self.num_agents)
+            priorities = priorities.detach().clamp(min=1e-3).cpu().numpy()
             flat_idx = sample['indices'].reshape(-1)
+
             trajectories.update_priorities(flat_idx, priorities)
         
-        # self.target_entropy = max(self.min_target_entropy, -float(self.action_dims)*(1.0 - step_fraction))
-
+        if step_fraction > 0.6:
+            progress = step /step_fraction
+            cosine = 0.5 * (1+np.cos(np.pi * progress))
+            sched = self.min_target_entropy + cosine * (-float(self.action_dims)-self.min_target_entropy)
+            self.target_entropy = sched
         # Record all losses for logging
         # Return meaningful average loss values clearly
         return (
             np.mean(actor_loss_l) if actor_loss_l else 0.0,
             np.mean(critic_loss_l) if critic_loss_l else 0.0,
+            intrinsic_rewards.mean().item(),
+            icm_loss.item()
         )
 
 
