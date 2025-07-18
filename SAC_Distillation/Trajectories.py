@@ -58,7 +58,7 @@ class SAC_ExperienceBuffer:
     Supports calculating discounted returns and advantages.
     """
     def __init__(self, camera_obs_dim, vector_obs_dim, action_dim, params):
-        self.buffer_size = params.get('buffer_size', 400_000)
+        self.buffer_size = params.get('buffer_size', 1_000_000)
         self.gamma = params.get('gamma', 0.99)
         self.lambda_ = params.get('lambda_', 0.95)
         self.camera_stat = RunningStat(camera_obs_dim)
@@ -83,7 +83,7 @@ class SAC_ExperienceBuffer:
         self.actions[idx] = action
         self.dones[idx] = done
 
-        reward = np.clip(reward, -5.0, 50.0)
+        
         self.reward_stat.update(reward)
         self.rewards[idx] = reward
         

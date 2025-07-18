@@ -6,7 +6,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as distributions
 import wandb
-from .Nets import SACNet, CentralizedCriticNet, ICM
+from .Nets import SACNet, CentralizedCriticNet, RND, RunningStat
 from .VipTeacher import VipTeacher
 from .TeacherModel import DistillationDataset, TeacherStudentPairs
 from torch.utils.data import DataLoader
@@ -51,6 +51,8 @@ def _process_image(image):
         image = image.to(device, dtype=torch.float32)
     if len(image.shape) == 3:
         image = image.unsqueeze(0)
+    if image.max() > 1.0:
+        image = image / 255.0
     return image
 
 def cosine_sigma(init, final, frac):
@@ -75,32 +77,38 @@ class DistilledSAC:
         self.critic_updates = params.get('critic_updates', 3)
         self.actor_updates = params.get('actor_updates', 1)
         self.distill_coef = params.get('distill_coef', 0.06)
+        self.current_curiosity_coef = params.get('curiosity_coeff', 0.1)
         self.init_noise = 0.4
         self.final_noise = 0.05
         self.noise_decay = 0.3
 
+        self.reward_stat = None
+
         # Initialize Networks
         self.model = SACNet(camera_obs_dim, vector_obs_dim, self.action_dims).to(self.device)
-        
         self.num_agents = num_agents
-        print("Number of agents: ", num_agents)
-        print("Action dimensions: ", self.action_dims)
-
         feat_dim = self.model.feat_dim
         self.ccritic = CentralizedCriticNet(feat_dim, self.action_dims, num_agents).to(self.device)
+        self.ccritic_tgt = copy.deepcopy(self.ccritic).to(self.device)
 
-        self.icm = ICM(feat_dim, self.action_dims).to(self.device)
-        self.icm_optimizer = optim.AdamW(self.icm.parameters(), lr=1e-4)
-        self.curiosity_coef = params.get('curiosity_coef', 0.01)
+        self.rnd_lr = params.get('rnd_lr', 1e-4)
+        self.intrinsic_reward_coef = params.get('intrinsic_reward_coef', 0.05)
+        self.extrinsic_reward_coef = params.get('extrinsic_reward_coef', 2.0)
+        self.rnd_update_proportion = params.get('rnd_update_proportion', 0.25)
+        self.rnd = RND(input_dim=feat_dim).to(self.device)
+        self.rnd_optimizer = optim.AdamW(self.rnd.parameters(), lr=self.rnd_lr)
+        
+        self.intrinsic_reward_normalizer = RunningStat(shape=(1,))
 
         self.ccritic_tgt = copy.deepcopy(self.ccritic).to(self.device)
         self.actor_optimizer = optim.AdamW(self.model.parameters(), lr=self.actor_lr, weight_decay=1e-4)
-        self.critic_optim = optim.AdamW(self.ccritic.parameters(), lr=self.critic_lr, weight_decay=1e-4)
-        self.critic_head_optim = optim.AdamW(self.ccritic.q_heads.parameters(), lr=5*self.critic_lr)
-        self.ccritic_tgt.load_state_dict(self.ccritic.state_dict())
-        self.ccritic_tgt.eval()
+        head_params = list(self.ccritic.q_head_1.parameters()) + list(self.ccritic.q_head_2.parameters())
+        base_params = [p for p in self.ccritic.parameters() if id(p) not in {id(param) for param in head_params}]
+        self.critic_optim = optim.AdamW(base_params, lr=self.critic_lr, weight_decay=1e-4)
+        self.critic_head_optim = optim.AdamW(head_params, lr=self.critic_lr, weight_decay=1e-4)
+        
 
-        self.target_entropy = -float(self.action_dims)
+        self.target_entropy = -2.0 * np.log(1.0 / self.action_dims)
         self.log_alpha = torch.tensor(np.log(0.2), requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=self.alpha_lr)
 
@@ -119,7 +127,7 @@ class DistilledSAC:
 
         self._offline_done = False
         self._conv_unfrozen = False
-        self.warmup_steps = getattr(params, 'warmup_steps', 20000)
+        self.warmup_steps = params.get('warmup_steps', 20000)
         self.scaler = torch.amp.GradScaler('cuda',enabled=device.type == 'cuda')
 
     def _encode(self, cam, vec):
@@ -130,8 +138,10 @@ class DistilledSAC:
     def _sample(dist):
         z = dist.rsample()
         action = torch.tanh(z)
+        action_processed = action.clone()
+        action_processed[action_processed.abs()<0.1] = 0.0
         log_pi = (dist.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)).sum(dim=-1, keepdim=True)
-        return action, log_pi.sum(dim=-1, keepdim=True)
+        return action_processed, log_pi
     
     def get_action(self, camera_obs, vector_obs, train=False):
         camera_obs = _process_image(camera_obs)
@@ -294,6 +304,10 @@ class DistilledSAC:
         curr_tau = tau_min + step_fraction * (tau_max - tau_min)
 
         actor_loss_l, critic_loss_l = [], []
+
+        if self.reward_stat is None:
+            self.reward_stat = trajectories.reward_stat
+
         for i in range(self.train_epochs):
 
             sample = trajectories.sample_joint(self.batch_size, alpha=0.6, beta=beta, n_step=3)
@@ -313,11 +327,8 @@ class DistilledSAC:
 
             if weights.ndim > 2:                                # came from sample_joint
                 B, N, _ = weights.shape
-                # This is still needed for the actor loss later, which expects a flattened tensor
-                weights_flat   = weights.view(B * N, 1)         # Shape: (4096, 1)
-
-                # Squeeze the last dimension of the original weights tensor to get the correct shape
-                weights_critic = weights.squeeze(-1)            # Shape: (1024, 4)
+                weights_flat = weights.reshape(B*N, 1)
+                weights_critic = weights.squeeze(-1)
             else:                                               # single-agent sample
                 weights_flat   = weights                        
                 weights_critic = weights.squeeze(-1) # Also squeeze here for consistency
@@ -337,119 +348,123 @@ class DistilledSAC:
             with torch.no_grad():
                 feats_next = self._encode(next_camera_obs, next_vector_obs)
             feats_now = self._encode(camera_obs, vector_obs)
+            
+            self.rnd_optimizer.zero_grad(set_to_none=True)
+            num_updates = int(self.batch_size * self.rnd_update_proportion)
+            perm = torch.randperm(self.batch_size)[:num_updates]
 
-            self.icm_optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
-                intrinsic_rewards, fwd_loss, inv_loss = self.icm(feats_now.detach(), feats_next.detach(), actions)
-                icm_loss = (0.8 * fwd_loss) + (0.2 * inv_loss)
-
-            self.scaler.scale(icm_loss).backward(retain_graph=True)
-            self.scaler.unscale_(self.icm_optimizer)
+            rnd_loss = self.rnd.compute_loss(feats_next[perm])
+            self.scaler.scale(rnd_loss).backward()
+            self.scaler.step(self.rnd_optimizer)
             
 
 
             # --- Critic Training ---
 
             with torch.no_grad():
-                next_action = self.get_action(next_camera_obs, next_vector_obs, train=False)
-                
-                sigma = torch.tensor(self._exploration_noise(step_fraction), device=device, dtype=next_action.dtype)
-                eps = torch.randn_like(next_action) * sigma
-                next_action = (next_action + eps).clamp(-1.0, 1.0)
+                next_action, next_logp = self.get_action(next_camera_obs, next_vector_obs, train=True)
 
-                q_next = self.ccritic_tgt(feats_next, next_action)
+                q1_next, q2_next = self.ccritic_tgt(feats_next, next_action)
+                min_q_next_target = torch.min(q1_next, q2_next)
+                alpha = self.log_alpha.exp()
+
+                next_logp = next_logp.view(B,N)
+
+                soft_q_target = min_q_next_target - alpha * next_logp
+                
 
                 r_env = rewards.view(-1,1)
                 done_env = done_flags.view(-1,1).float()
 
-                decay_factor = max(0.0, 1.0 - step_fraction)
-                self.current_curiosity_coef = self.curiosity_coef * decay_factor
+                r_intrinsic = self.rnd(feats_next)
+                self.intrinsic_reward_normalizer.update(r_intrinsic)
 
-                total_reward = r_env + self.current_curiosity_coef * intrinsic_rewards.detach()
-                total_reward_reshaped = total_reward.view(B,N)
+                norm_r_instrinsic = r_intrinsic / self.intrinsic_reward_normalizer.std.to(self.device)
+                total_reward = (self.extrinsic_reward_coef * r_env) + (self.intrinsic_reward_coef * norm_r_instrinsic)
+
+                mean_r = torch.from_numpy(self.reward_stat.mean).to(device)
+                std_r = torch.from_numpy(self.reward_stat.std).to(device)
+                normalized_reward = (total_reward - mean_r) / (std_r + 1e-8)
+                normalized_reward_reshaped = normalized_reward.view(B,N)
                 done_reshaped = done_env.view(B,N)
 
-                td_target = total_reward_reshaped + (1.0 - done_reshaped) * self.gamma * q_next
+                td_target = normalized_reward_reshaped + (1.0 - done_reshaped) * self.gamma * soft_q_target
             
-            for _ in range(self.critic_updates):
-                self.critic_optim.zero_grad(set_to_none=True)
-                self.critic_head_optim.zero_grad(set_to_none=True)
-                with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
-                    q_pred = self.ccritic(feats_now.detach(), actions)
-                    critic_loss = (weights_critic * F.huber_loss(q_pred, td_target, delta=10.0, reduction='none')).mean()
+            
+            self.critic_optim.zero_grad(set_to_none=True)
+            self.critic_head_optim.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
+                q1_pred, q2_pred = self.ccritic(feats_now.detach(), actions)
+                critic_loss_1 = (weights_critic * F.huber_loss(q1_pred, td_target.detach(), delta=2.0, reduction='none')).mean()
+                critic_loss_2 = (weights_critic * F.huber_loss(q2_pred, td_target.detach(), delta=2.0, reduction='none')).mean()
+                critic_loss = critic_loss_1 + critic_loss_2
 
-                self.scaler.scale(critic_loss).backward()
-                self.scaler.unscale_(self.critic_optim)
-                self.scaler.unscale_(self.critic_head_optim)
-                torch.nn.utils.clip_grad_norm_(self.ccritic.parameters(), max_norm=1.0)
-                scale = self.scaler.get_scale()
-                self.scaler.step(self.critic_optim)
-                self.scaler.step(self.critic_head_optim)
-                self.scaler.update()
-
-                if not scale != self.scaler.get_scale():
-                    self.critic_scheduler.step()
-
-                with torch.no_grad():
-                    for p_t, p in zip(self.ccritic_tgt.parameters(), self.ccritic.parameters()):
-                        p_t.data.lerp_(p.data, curr_tau)
+            self.scaler.scale(critic_loss).backward()
+            self.scaler.unscale_(self.critic_optim)
+            self.scaler.unscale_(self.critic_head_optim)
+            torch.nn.utils.clip_grad_norm_(self.ccritic.parameters(), max_norm=1.0)
+            self.scaler.step(self.critic_optim)
+            self.scaler.step(self.critic_head_optim)
 
             critic_loss_l.append(critic_loss.item())
 
             # --- Actor Training ---
             if i % curr_policy_delay == 0:
-
-
-                for _ in range(self.actor_updates):
-                    self.actor_optimizer.zero_grad(set_to_none=True)
-                    with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
-                        new_a, logp = self.get_action(camera_obs, vector_obs, train=True)
-                        q_new = self.ccritic(feats_now, new_a)
-                        q_new_min = q_new.min(dim=1, keepdim=True).values
-                        q_new_min_exp = q_new_min.repeat(1,N).view(B*N,1)
-                        actor_loss = (weights_flat *(self.log_alpha.exp().detach()*logp-q_new_min_exp)).mean()
-                        actor_loss_l.append(actor_loss.item())
-
-                    self.scaler.scale(actor_loss).backward()
-                    scale = self.scaler.get_scale()
-                    self.scaler.step(self.actor_optimizer)
-                    self.scaler.update()
-                    if not scale != self.scaler.get_scale():
-                        self.actor_scheduler.step()
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
+                    new_a, logp = self.get_action(camera_obs, vector_obs, train=True)
+                    with torch.no_grad():
+                        q1_new, q2_new = self.ccritic(feats_now, new_a)
+                        q_new = torch.min(q1_new, q2_new).view(B*N,1)
                 
+                    actor_loss = (weights_flat *(self.log_alpha.exp().detach()*logp-q_new)).mean()
                 
-                # # --- Entropy Regularization ---
-                entropy_err = (logp + self.target_entropy).detach()
-                entropy_loss = -(weights_flat * self.log_alpha * entropy_err).mean()
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.unscale_(self.actor_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.actor_optimizer)
+                actor_loss_l.append(actor_loss.item())
+                
 
                 self.alpha_optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(entropy_loss).backward()
+                with torch.amp.autocast('cuda',enabled=device.type == 'cuda'):
+                    entropy_err = (logp + self.target_entropy).detach()
+                    alpha_loss = -(self.log_alpha * entropy_err).mean()
+                self.scaler.scale(alpha_loss).backward()
+                self.scaler.unscale_(self.alpha_optimizer)
+                torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.scaler.step(self.alpha_optimizer)
-                self.scaler.update()
 
-                with torch.no_grad():
-                    self.log_alpha.clamp_(min=np.log(1e-5), max=np.log(1e2))
+            with torch.no_grad():
+                for p_t,p in zip(self.ccritic_tgt.parameters(), self.ccritic.parameters()):
+                    p_t.data.lerp_(p.data, curr_tau)
+                self.log_alpha.copy_(self.log_alpha.clamp_(min=np.log(1e-5), max=np.log(1e2)))
+
+            self.scaler.update()
+            self.actor_scheduler.step()
+            self.critic_scheduler.step()
             
-            td_err = (q_pred - td_target).abs()
-            td_err_per_env = td_err.max(dim=1).values
-            priorities = td_err_per_env.repeat_interleave(self.num_agents)
-            priorities = priorities.detach().clamp(min=1e-3).cpu().numpy()
-            flat_idx = sample['indices'].reshape(-1)
+            with torch.no_grad():
+                td_err_1 = (q1_pred - td_target).abs()
+                td_err_2 = (q2_pred - td_target).abs()
+                per_agent_td_err = torch.max(td_err_1, td_err_2)
 
-            trajectories.update_priorities(flat_idx, priorities)
+                priorities = per_agent_td_err.detach().clamp(min=1e-3).cpu().numpy().flatten()
+                flat_idx = sample["indices"].flatten()
+                trajectories.update_priorities(flat_idx, priorities)
         
         if step_fraction > 0.6:
-            progress = step /step_fraction
-            cosine = 0.5 * (1+np.cos(np.pi * progress))
-            sched = self.min_target_entropy + cosine * (-float(self.action_dims)-self.min_target_entropy)
+            progress = (step_fraction - 0.6) / 0.4
+            cosine = 0.5 * (1 + np.cos(np.pi * progress))
+            sched = self.min_target_entropy + cosine * (self.target_entropy - self.min_target_entropy)
             self.target_entropy = sched
         # Record all losses for logging
         # Return meaningful average loss values clearly
         return (
             np.mean(actor_loss_l) if actor_loss_l else 0.0,
             np.mean(critic_loss_l) if critic_loss_l else 0.0,
-            intrinsic_rewards.mean().item(),
-            icm_loss.item()
+            r_intrinsic.mean().item(),
+            rnd_loss.item()
         )
 
 

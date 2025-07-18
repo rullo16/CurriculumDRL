@@ -29,15 +29,6 @@ def safe_orthogonal_initialization(module, gain=nn.init.calculate_gain('relu')):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def _init_weights(m):
-    for name, param in m.named_parameters():
-        if 'weight_ih' in name:
-            nn.init.xavier_uniform_(param.data)
-        elif 'weight_hh' in name:
-            nn.init.orthogonal_(param.data)
-        elif 'bias' in name:
-            nn.init.constant_(param.data, 0)
-
 class FeatureExtractionNet(nn.Module):
     def __init__(self, input_shape, distilled_dim=2048):
         super(FeatureExtractionNet, self).__init__()
@@ -58,7 +49,7 @@ class FeatureExtractionNet(nn.Module):
     def forward(self, x, distill=False):
         x = x.float()
         if x.max() > 1.01:
-            x.div(255.0)  # Normalize input to [0, 1]
+            x = x / 255.0  # Normalize input to [0, 1]
         conv_out = self.convolutional_pipeline(x).view(x.size(0), -1)
         if distill:
             conv_out = self.dropout(conv_out)
@@ -184,34 +175,95 @@ class CriticNet(nn.Module):
         x = self.backbone(x)
         return self.q1(x), self.q2(x)
     
+class RunningStat:
+    def __init__(self, shape, eps=1e-4):
+        self._mean = torch.zeros(shape, dtype=torch.float32).to(device)
+        self._var = torch.ones(shape, dtype=torch.float32).to(device)
+        self._count = eps
 
-class ICM(nn.Module):
-    def __init__(self, feature_dim, action_dim, hidden_dim=256):
+    def update(self, x):
+        if x.device != device:
+            x = x.to(device)
+
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        batch_count = x.shape[0]
+
+        if batch_count == 0:
+            return
+        
+
+        delta = batch_mean - self._mean
+        tot_count = self._count + batch_count
+
+        self._mean += delta * batch_count / tot_count
+        m_a = self._var * self._count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + (delta.pow(2) * self._count * batch_count / tot_count)
+        self._var = m2 / tot_count
+        self._count = tot_count
+
+    @property
+    def mean(self): return self._mean
+    @property
+    def std(self): return torch.sqrt(self._var + 1e-8)
+    
+
+class RND(nn.Module):
+    """
+    Random Network Distillation (RND) module.
+    Generates intrinsic rewards based on the difference between a target network and a predictor network.
+    """
+
+    def __init__(self, input_dim, hidden_dim=256, output_dim=512):
         super().__init__()
-        self.inverse_model = nn.Sequential(
-            nn.Linear(feature_dim*2, hidden_dim),
+        self.target_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
         )
 
-        self.forward_model = nn.Sequential(
-            nn.Linear(feature_dim + action_dim, hidden_dim),
+        self.predictor_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, feature_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
         )
 
-        self.apply(safe_orthogonal_initialization)
+        for param in self.target_net.parameters():
+            param.requires_grad = False
 
-    def forward(self, state_feat, next_state_feat, action):
-        predicted_next_feat = self.forward_model(torch.cat([state_feat, action], dim=-1))
-        intrinsic_reward = F.mse_loss(predicted_next_feat, next_state_feat.detach(), reduction='none').mean(dim=-1, keepdim=True)
+        self.obs_normalizer = RunningStat(shape=(input_dim,))
 
-        forward_loss = F.mse_loss(predicted_next_feat, next_state_feat.detach())
+    def forward(self, x):
+        
+        self.obs_normalizer.update(x)
+        normalized_obs = (x - self.obs_normalizer.mean) / self.obs_normalizer.std
+        normalized_obs = torch.clamp(normalized_obs, -5.0, 5.0)
 
-        predicted_action = self.inverse_model(torch.cat([state_feat, next_state_feat], dim=-1))
-        inverse_loss = F.mse_loss(predicted_action, action.detach())
+        with torch.no_grad():
+            target_features = self.target_net(normalized_obs)
+        
+        predicted_features = self.predictor_net(normalized_obs)
+        intrinsic_reward = torch.mean((predicted_features - target_features).pow(2), dim=1, keepdim=True)
 
-        return intrinsic_reward, forward_loss, inverse_loss
+        return intrinsic_reward
+    
+    def compute_loss(self, obs):
+
+        self.obs_normalizer.update(obs)
+        normalized_obs = (obs - self.obs_normalizer.mean) / self.obs_normalizer.std
+        normalized_obs = torch.clamp(normalized_obs, -5.0, 5.0)
+
+        with torch.no_grad():
+            target_features = self.target_net(normalized_obs.detach())
+        predicted_features = self.predictor_net(normalized_obs.detach())
+        return F.mse_loss(predicted_features, target_features)
+
+
     
 class CentralizedCriticNet(nn.Module):
     def __init__(self, per_agent_dim, action_dim, num_agents):
@@ -219,10 +271,9 @@ class CentralizedCriticNet(nn.Module):
         self.num_agents = num_agents
         self.per_agent_dim = per_agent_dim
         self.action_dim = action_dim
-
-
         centralized_input_dim = num_agents * (per_agent_dim + action_dim)
         
+
         self.backbone = nn.Sequential(
             nn.Linear(centralized_input_dim,512),
             nn.LayerNorm(512),
@@ -232,20 +283,21 @@ class CentralizedCriticNet(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.q_heads = nn.ModuleList(
-            [nn.Linear(256,1) for _ in range(num_agents)]
-        )
+        self.q_head_1 = nn.Linear(256,1)
+        self.q_head_2 = nn.Linear(256,1)
 
         self.apply(safe_orthogonal_initialization)
 
     def forward(self, feats, actions):
         batch_size = feats.shape[0] // self.num_agents
-
         x_per_agent = torch.cat([feats, actions], dim=-1)
         x_centralized = x_per_agent.view(batch_size, -1)
-        h = self.backbone(x_centralized)
-        qs = torch.cat([head(h) for head in self.q_heads], dim=1)
-        return qs
+
+        h = self.backbone(x_centralized)  # [batch_size, 256]
+
+        q1s = self.q_head_1(h).repeat(1, self.num_agents)
+        q2s = self.q_head_2(h).repeat(1, self.num_agents)
+        return q1s, q2s
     
 class GaussianPolicy(nn.Module):
     def __init__(self, input_dim, act_dim):
@@ -254,9 +306,12 @@ class GaussianPolicy(nn.Module):
         self.log_std = nn.Linear(input_dim, act_dim)
 
     def forward(self, x):
+        x = x.float()
+        if x.max() > 1.01:
+            x = x / 255.0  # Normalize input to [0, 1]
         mu = self.mu(x)
-        log_std = torch.clamp(self.log_std(x), -5.0, 1.5)
-        std = torch.exp(log_std)
+        log_std = torch.clamp(self.log_std(x), min=-20, max=2)
+        std = torch.exp(log_std).clamp(min=1e-6)
         dist = torch.distributions.Normal(mu, std)
         return dist
     
@@ -269,48 +324,30 @@ class SACNet(nn.Module):
         self.conv_out_size = self._get_conv_out(camera_obs_dim)
         self.feat_dim = 256
         self.n_actions = n_actions
+
         self.vector_processor = nn.Sequential(
             nn.LayerNorm(vector_obs_dim[0]),
             nn.Linear(vector_obs_dim[0], 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 128),
-            nn.ReLU(inplace=True),
         )
 
-
-        # self.rnn = nn.GRU(
-        #     input_size=self.conv_out_size+64,
-        #     hidden_size=512, num_layers=2,
-        #     batch_first=True, dropout=0.2
-        # )
-
-        # self.rnn_lr = nn.LayerNorm(512)
-
+        combined_input_dim = self.conv_out_size + 128  # 128 from vector_obs processing
+        
         self.backbone = nn.Sequential(
-            nn.LazyLinear(256),
-            nn.LayerNorm(256),
+            nn.Linear(combined_input_dim,512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
+            nn.Linear(512, self.feat_dim),
+            nn.LayerNorm(self.feat_dim),
             nn.ReLU(inplace=True),
         )
-
-        self.fully_connected_pipeline = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-        )
-
-        self.policy_head = GaussianPolicy(256, self.n_actions)
 
         input_dim = 128 + self.n_actions
 
+        self.policy_head = GaussianPolicy(256, self.n_actions)
 
-        self.fully_connected_pipeline.apply(safe_xavier_initialization)
+        self.vector_processor.apply(safe_xavier_initialization)
+        self.backbone.apply(safe_xavier_initialization)
         self.policy_head.apply(safe_xavier_initialization)
 
     def dist_from_feats(self, feats):
@@ -320,20 +357,15 @@ class SACNet(nn.Module):
         with torch.no_grad():
             dummy_input = torch.zeros(1, *shape)
             output = self.convolution_pipeline(dummy_input)
-        self.convolution_pipeline.train()
         return int(np.prod(output.size()[1:]))
     
     def forward(self, camera_obs, vector_obs):
-        vec_feat = self.vector_processor(vector_obs)  # [batch_size, 128]
-        fc_input = torch.cat([self.convolution_pipeline(camera_obs), vec_feat], dim=1)  # modified to ensure same dimensions
-        rnn_out = self.backbone(fc_input)  # [batch_size, 512]
-        fc_out = self.fully_connected_pipeline(rnn_out)
-        logits = self.policy_head(fc_out)  # [batch_size, n_actions]
+        feats = self.encode(camera_obs, vector_obs)
+        logits = self.policy_head(feats)
         return logits
     
     def encode(self, camera_obs, vector_obs):
         cam = self.convolution_pipeline(camera_obs)  # [batch_size, conv_dim]
         vec_feat = self.vector_processor(vector_obs)  # [batch_size, 128]
         feats = self.backbone(torch.cat([cam, vec_feat], dim=1))  # [batch_size, 512]
-        feats = self.fully_connected_pipeline(feats)
         return feats

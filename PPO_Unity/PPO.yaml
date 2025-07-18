@@ -7,7 +7,7 @@ behaviors:
     ##########################################################################
     # 2 ▸ PPO hyper-parameters
     hyperparameters:
-      batch_size:        4096            #  ≈4×time_horizon → stable SGD
+      batch_size:        1024            #  ≈4×time_horizon → stable SGD
       buffer_size:       163840          #  40×batch_size
       learning_rate:     2.0e-4          #  lower because reward magnitudes ↓
       learning_rate_schedule: linear
@@ -29,7 +29,7 @@ behaviors:
       memory:                        # 1-layer LSTM smooths inertial control
         memory_size:     256
         sequence_length: 32
-      vis_encode_type: simple        #  keep conv off (no CameraSensor)
+      vis_encode_type: resnet        #  keep conv off (no CameraSensor)
 
     ##########################################################################
     # 4 ▸ reward signals
