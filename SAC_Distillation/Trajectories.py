@@ -98,7 +98,8 @@ class SAC_ExperienceBuffer:
         self.ptr = (self.ptr + 1) % self.buffer_size
         self.size = min(self.size + 1, self.buffer_size)
 
-    def store_joint(self, camera_obs, vector_obs, action, reward, next_camera_obs, next_vector_obs, done, priority=1.0):
+    def store_joint(self, camera_obs, vector_obs, action, reward, next_camera_obs, next_vector_obs, done, priority=1.0, num_agents=4):
+        
         for i in range(camera_obs.shape[0]):
             self.store(camera_obs[i], vector_obs[i], action[i], reward[i], next_camera_obs[i], next_vector_obs[i], done[i], priority)
 

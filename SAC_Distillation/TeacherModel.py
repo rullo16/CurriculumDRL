@@ -65,11 +65,11 @@ class TeacherModel(nn.Module):
         return pv.float().to(device, non_blocking=True)    # send once to GPU
 
     def forward(self, x, no_grad=True):
-        imgs = self._get_inputs(x)  # Already on GPU, no repeated .to(device)
+        imgs = self._get_inputs(x)
         ctx = torch.no_grad() if no_grad else torch.enable_grad()
         with ctx:
-            out = self.teacher(imgs).last_hidden_state
-            feats = out.mean(dim=[2,3])
+            out = self.teacher(imgs).las_hidden_state
+            feats = out.mean(dim=1)
         return self.head(feats)
     
     def contrastive_loss(self, features, margin=1.0):

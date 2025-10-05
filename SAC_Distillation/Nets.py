@@ -32,6 +32,7 @@ def count_parameters(model):
 class FeatureExtractionNet(nn.Module):
     def __init__(self, input_shape, distilled_dim=2048):
         super(FeatureExtractionNet, self).__init__()
+        self.expected_hw = (input_shape[1], input_shape[2])
         self.convolutional_pipeline = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4, padding=2), nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), nn.ReLU(),
@@ -47,14 +48,21 @@ class FeatureExtractionNet(nn.Module):
         self.convolutional_pipeline.apply(safe_xavier_initialization)
 
     def forward(self, x, distill=False):
-        x = x.float()
-        if x.max() > 1.01:
-            x = x / 255.0  # Normalize input to [0, 1]
+        # scale only if raw bytes
+        if x.dtype == torch.uint8:
+            x = x.float() / 255.0
+        else:
+            x = x.float()
+
+        if x.shape[-2:] != self.expected_hw:
+            x = F.interpolate(x, size=self.expected_hw, mode='bilinear', align_corners=False)
+
         conv_out = self.convolutional_pipeline(x).view(x.size(0), -1)
         if distill:
             conv_out = self.dropout(conv_out)
             return self.distilled_converter(conv_out)
         return conv_out
+
 
 
 class SparseAttention(nn.Module):
@@ -184,7 +192,6 @@ class RunningStat:
     def update(self, x):
         if x.device != device:
             x = x.to(device)
-
         batch_mean = x.mean(dim=0)
         batch_var = x.var(dim=0, unbiased=False)
         batch_count = x.shape[0]
@@ -192,7 +199,6 @@ class RunningStat:
         if batch_count == 0:
             return
         
-
         delta = batch_mean - self._mean
         tot_count = self._count + batch_count
 
@@ -215,7 +221,7 @@ class RND(nn.Module):
     Generates intrinsic rewards based on the difference between a target network and a predictor network.
     """
 
-    def __init__(self, input_dim, hidden_dim=256, output_dim=512):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=512, eps = 1e-8):
         super().__init__()
         self.target_net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -235,33 +241,72 @@ class RND(nn.Module):
 
         for param in self.target_net.parameters():
             param.requires_grad = False
+        self.target_net.eval()
 
         self.obs_normalizer = RunningStat(shape=(input_dim,))
+        self.rew_normaliser = RunningStat(shape=(1,))
+        self._eps = eps
 
-    def forward(self, x):
-        
-        self.obs_normalizer.update(x)
-        normalized_obs = (x - self.obs_normalizer.mean) / self.obs_normalizer.std
-        normalized_obs = torch.clamp(normalized_obs, -5.0, 5.0)
-
-        with torch.no_grad():
-            target_features = self.target_net(normalized_obs)
-        
-        predicted_features = self.predictor_net(normalized_obs)
-        intrinsic_reward = torch.mean((predicted_features - target_features).pow(2), dim=1, keepdim=True)
-
-        return intrinsic_reward
+    def _to_stat_tensor(self, arr, device, dtype):
+        """Return arr as a torch.Tensor on (device, dtype) with no grad."""
+        if isinstance(arr, torch.Tensor):
+            return arr.to(device=device, dtype=dtype)
+        # RunningStat may store numpy arrays
+        return torch.as_tensor(arr, device=device, dtype=dtype)
     
-    def compute_loss(self, obs):
+    def _normalise_obs(self, x):
+        """Z-score using running stats (eps-stable) and clamp."""
+        m = self._to_stat_tensor(self.obs_normalizer.mean, x.device, x.dtype)
+        s = self._to_stat_tensor(self.obs_normalizer.std,  x.device, x.dtype)
+        x = (x - m) / (s + self._eps)
+        return x.clamp_(-5.0, 5.0)
+    
+    @torch.no_grad()
+    def update_obs_stats(self, obs):
+        if obs.is_cuda:
+            self.obs_normalizer.update(obs.detach().cpu())
+        else:
+            self.obs_normalizer.update(obs.detach())
 
-        self.obs_normalizer.update(obs)
-        normalized_obs = (obs - self.obs_normalizer.mean) / self.obs_normalizer.std
-        normalized_obs = torch.clamp(normalized_obs, -5.0, 5.0)
+    @torch.no_grad()
+    def reset_episode(self):
+        pass
+
+    def forward(self, x: torch.Tensor, normalise_reward: bool = False,
+            clamp_min: float = 1e-3) -> torch.Tensor:
+        """
+        Compute intrinsic reward (per-sample MSE) with optional z-norm.
+        No gradients flow through this path (predictor trains via compute_loss()).
+        """
+        x_n = self._normalise_obs(x)
 
         with torch.no_grad():
-            target_features = self.target_net(normalized_obs.detach())
-        predicted_features = self.predictor_net(normalized_obs.detach())
-        return F.mse_loss(predicted_features, target_features)
+            # target is fixed; predictor outputs used only for reward
+            t = self.target_net(x_n)
+            p = self.predictor_net(x_n)
+
+            intr = (p - t).pow(2).mean(dim=1, keepdim=True)
+            intr = intr.clamp_min(clamp_min)  # keep curiosity from vanishing
+
+            if normalise_reward:
+                # RunningStat.update accepts tensors on any device
+                self.rew_normaliser.update(intr)
+                rm = self._to_stat_tensor(self.rew_normaliser.mean, intr.device, intr.dtype)
+                rs = self._to_stat_tensor(self.rew_normaliser.std,  intr.device, intr.dtype)
+                intr = (intr - rm) / (rs + self._eps)
+
+        return intr  # already detached by no_grad
+
+
+    def compute_loss(self, obs):
+       
+        if obs.numel() == 0:
+            return obs.sum() * 0.0
+        x_n = self._normalise_obs(obs)
+        with torch.no_grad():
+            t = self.target_net(x_n)
+        p = self.predictor_net(x_n)
+        return F.mse_loss(p, t)
 
 
     
@@ -295,8 +340,8 @@ class CentralizedCriticNet(nn.Module):
 
         h = self.backbone(x_centralized)  # [batch_size, 256]
 
-        q1s = self.q_head_1(h).repeat(1, self.num_agents)
-        q2s = self.q_head_2(h).repeat(1, self.num_agents)
+        q1s = self.q_head_1(h)
+        q2s = self.q_head_2(h)
         return q1s, q2s
     
 class GaussianPolicy(nn.Module):
@@ -307,8 +352,6 @@ class GaussianPolicy(nn.Module):
 
     def forward(self, x):
         x = x.float()
-        if x.max() > 1.01:
-            x = x / 255.0  # Normalize input to [0, 1]
         mu = self.mu(x)
         log_std = torch.clamp(self.log_std(x), min=-20, max=2)
         std = torch.exp(log_std).clamp(min=1e-6)
@@ -320,7 +363,7 @@ class SACNet(nn.Module):
         super(SACNet, self).__init__()
         self.camera_obs_dim = camera_obs_dim
         self.vector_obs_dim = vector_obs_dim
-        self.convolution_pipeline = FeatureExtractionNet(camera_obs_dim, distilled_dim=12800)
+        self.convolution_pipeline = FeatureExtractionNet(camera_obs_dim, distilled_dim=2048)
         self.conv_out_size = self._get_conv_out(camera_obs_dim)
         self.feat_dim = 256
         self.n_actions = n_actions
