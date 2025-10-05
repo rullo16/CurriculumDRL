@@ -68,7 +68,7 @@ class TeacherModel(nn.Module):
         imgs = self._get_inputs(x)
         ctx = torch.no_grad() if no_grad else torch.enable_grad()
         with ctx:
-            out = self.teacher(imgs).las_hidden_state
+            out = self.teacher(imgs).last_hidden_state
             feats = out.mean(dim=1)
         return self.head(feats)
     

@@ -32,7 +32,7 @@ SAC_DISTILLED = {
     "noise_std": 0.2,
     "smooth_clip": 0.2,
     "rnd_update_proportion": 0.05,
-    "intrinsic_reward_coef":        0.5,      # starting weight
+    "intrinsic_reward_coef_init":        0.5,      # starting weight
     "intrinsic_reward_coef_final":  0.15,      # NEW: target weight after decay
     "intrinsic_coef_decay_steps":   1_000_000,# NEW: linear decay horizon
     "extrinsic_reward_coef":        1.0,
