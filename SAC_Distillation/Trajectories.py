@@ -123,8 +123,9 @@ class SAC_ExperienceBuffer:
         d_k = self.dones[idxs_k]
 
         discounts = (self.gamma ** k).astype(np.float32)
-        mask = np.cumprod(1.0 - d_k, axis=1, dtype=np.float32)
-        mask[:, 0] = 1.0  # Ensure the first step is always included in the mask
+        mask = np.ones_like(d_k, dtype=np.float32)
+        for i in range(1, n_step):
+            mask[:, i] = mask[:,i-1]*(1.0-d_k[:, i-1])
         nstep_returns = (r_k * discounts * mask).sum(axis=1, keepdims=True)
 
         idx_n = np.minimum(batch_idxs + n_step, self.size - 1)
@@ -139,7 +140,7 @@ class SAC_ExperienceBuffer:
             camera_obs = norm_cam(self.camera_obs[batch_idxs]),
             vector_obs = norm_vec(self.vector_obs[batch_idxs]),
             actions = self.actions[batch_idxs],
-            # rewards = _norm_reward(self.rewards[batch_idxs,None], self.dones[batch_idxs,None], self.reward_stat.mean, self.reward_stat.std),
+            rewards = _norm_reward(self.rewards[batch_idxs,None], self.dones[batch_idxs,None], self.reward_stat.mean, self.reward_stat.std),
             rewards = self.rewards[batch_idxs, None],
             next_camera_obs = norm_cam(self.next_camera_obs[batch_idxs]),
             next_vector_obs = norm_vec(self.next_vector_obs[batch_idxs]),

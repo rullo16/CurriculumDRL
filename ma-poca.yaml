@@ -1,0 +1,123 @@
+# Force training & inference on the same GPU (prevents CPU/GPU tensor mix)
+torch_settings:
+  device: cuda:0
+  inference_device: cuda:0
+
+behaviors:
+  Drone:
+    trainer_type: poca            # MA-POCA (centralized critic, decentralized actors)
+    hyperparameters:
+      batch_size: 2048            # large on-policy batch for stability with visuals
+      buffer_size: 20480          # ~10× batch; enough trajectories per update
+      learning_rate: 3.0e-4
+      learning_rate_schedule: linear
+      beta: 5.0e-3                # entropy bonus (exploration)
+      epsilon: 0.2                # PPO-style clip range used by POCA optimizer
+      lambd: 0.95                 # GAE lambda
+      num_epoch: 3                # optimization passes per update
+      # NOTE: Centralized critic is built-in for MA-POCA; no extra flag needed
+    network_settings:
+      # Actor (per-agent, decentralized execution)
+      normalize: true             # normalize vector observations (running mean/var)
+      vis_encode_type: resnet     # stronger visual encoder for camera input
+      hidden_units: 512
+      num_layers: 2
+      memory:
+        sequence_length: 64
+        memory_size: 256        # enable only if you need recurrence
+
+    # Optional: a separate critic trunk; uncomment to customize critic capacity
+      critic:
+        network_settings:
+          normalize: true
+          vis_encode_type: resnet
+          hidden_units: 512
+          num_layers: 2
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+
+    max_steps: 5000000            # total env steps (all agents combined)
+    time_horizon: 1000            # long horizon helps with navigation & sparse goals
+    summary_freq: 10000
+    threaded: false               # on-policy trainers: keep single-threaded updates
+
+# # -------- Two-Level Curriculum (match the env’s exposed parameters) --------
+# environment_parameters:
+#   goal_distance:
+#     curriculum:
+#       - name: Level1_CloseGoal
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 200
+#           threshold: 0.6
+#         value: 8.0                 # easier: closer goals
+#       - name: Level2_FarGoal
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 300
+#           threshold: 0.6
+#         value: 20.0                # harder: farther goals
+
+#   obstacle_count:
+#     curriculum:
+#       - name: Level1_SparseObs
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 200
+#           threshold: 0.6
+#         value: 1                    # light clutter
+#       - name: Level2_DenseObs
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 300
+#           threshold: 0.6
+#         value: 5                    # denser clutter
+
+#   progress_weight:
+#     curriculum:
+#       - name: Level1_ProgressHeavy
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 200
+#           threshold: 0.6
+#         value: 1.0                  # emphasize dense progress early
+#       - name: Level2_ProgressLight
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 300
+#           threshold: 0.6
+#         value: 0.4                  # shift focus to sparse goal success
+
+#   ray_length:
+#     curriculum:
+#       - name: Level1_ShortRays
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 200
+#           threshold: 0.6
+#         value: 12.0
+#       - name: Level2_LongRays
+#         completion_criteria:
+#           measure: reward
+#           behavior: DroneMAPOCA
+#           signal_smoothing: true
+#           min_lesson_length: 300
+#           threshold: 0.6
+#         value: 20.0

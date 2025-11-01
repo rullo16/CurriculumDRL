@@ -17,3 +17,5 @@
 /data/
 /PPO_Unity/results/
 /SAC_Unity/results/
+results/
+saved_models/

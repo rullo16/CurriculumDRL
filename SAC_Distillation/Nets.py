@@ -58,80 +58,14 @@ class FeatureExtractionNet(nn.Module):
             x = F.interpolate(x, size=self.expected_hw, mode='bilinear', align_corners=False)
 
         conv_out = self.convolutional_pipeline(x).view(x.size(0), -1)
+
+        if hasattr(self, '_distillation_done') and self._distillation_done:
+            return self.distilled_converter(conv_out)
+        
         if distill:
             conv_out = self.dropout(conv_out)
             return self.distilled_converter(conv_out)
         return conv_out
-
-
-
-class SparseAttention(nn.Module):
-    def __init__(self, input_dim, head_dim=64):
-        super(SparseAttention, self).__init__()
-        self.query = nn.Linear(input_dim, head_dim)
-        self.key = nn.Linear(input_dim, head_dim)
-        self.value = nn.Linear(input_dim, head_dim)
-        self.scale = np.sqrt(head_dim)
-
-    def forward(self, x):
-        x_seq = x.unsqueeze(1)  
-        Q = self.query(x_seq)  # [batch_size, head_dim]
-        K = self.key(x_seq)    # [batch_size, head_dim]
-        V = self.value(x_seq)  # [batch_size, head_dim]
-
-        scores = torch.matmul(Q, K.transpose(-2,-1))/self.scale
-        weights = F.softmax(scores, dim=-1)  
-        attended = torch.matmul(weights, V)
-        return attended.squeeze(1)  
-
-
-class AdaptiveAttention(nn.Module):
-    def __init__(self, input_dim, max_heads=4, head_dim=64):
-        super(AdaptiveAttention, self).__init__()
-        self.max_heads = max_heads
-        self.head_selector = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ReLU(),
-            nn.Linear(16, max_heads),
-            nn.Softmax(dim=-1)
-        )
-        self.attention_heads = nn.ModuleList(
-            [SparseAttention(input_dim, head_dim) for _ in range(max_heads)]
-        )
-        self.output_layer = nn.Linear(head_dim, input_dim)
-
-    def forward(self, x, step_fraction):
-        """
-        x: Tensor [batch_size, input_dim]
-        step_fraction: Scalar tensor indicating training progress [0,1]
-        """
-        # Determine number of heads dynamically
-        step_tensor = torch.tensor([[step_fraction]], device=device)
-        head_logits = self.head_selector(step_tensor).view(self.max_heads, 1,1)  # [1, max_heads]
-        # Collect outputs from all heads explicitly
-        attention_outputs = torch.stack(
-            [head(x) for head in self.attention_heads], dim=0  # [max_heads, batch_size, head_dim]
-        )
-
-        # Explicitly compute weighted sum (smooth adaptive attention)
-        combined_attention = torch.sum(attention_outputs * head_logits, dim=0)  # [batch_size, head_dim]
-
-        # Project back to input_dim explicitly
-        final_attention = self.output_layer(combined_attention)  # [batch_size, input_dim]
-
-        return final_attention  # [batch_size, input_dim]
-    
-class AdaptiveGating(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(1,32), nn.ReLU(),
-            nn.Linear(32, dim), nn.Sigmoid()
-        )
-    def forward(self, x, step_fraction):
-        step_fraction = torch.as_tensor(step_fraction, device=x.device, dtype=x.dtype)
-        gate = self.fc(step_fraction.expand(1,1))
-        return x * gate  # Element-wise multiplication
 
 class EntropyTargetNet(nn.Module):
     def __init__(self):
@@ -272,31 +206,25 @@ class RND(nn.Module):
     def reset_episode(self):
         pass
 
-    def forward(self, x: torch.Tensor, normalise_reward: bool = False,
-            clamp_min: float = 1e-3) -> torch.Tensor:
-        """
-        Compute intrinsic reward (per-sample MSE) with optional z-norm.
-        No gradients flow through this path (predictor trains via compute_loss()).
-        """
+    @torch.no_grad()
+    def forward(self, x, normalise_reward=False):
+        # NEVER update stats in forward
+        # Only compute reward
         x_n = self._normalise_obs(x)
+        t = self.target_net(x_n)
+        p = self.predictor_net(x_n)
+        intr = (p - t).pow(2).mean(dim=1, keepdim=True)
+        
+        if normalise_reward:
+            # Use existing stats, don't update
+            rm = self._to_stat_tensor(self.rew_normaliser.mean, intr.device, intr.dtype)
+            rs = self._to_stat_tensor(self.rew_normaliser.std, intr.device, intr.dtype)
+            intr = (intr - rm) / (rs + self._eps)
+        
+        return intr.clamp_min(1e-3)
 
-        with torch.no_grad():
-            # target is fixed; predictor outputs used only for reward
-            t = self.target_net(x_n)
-            p = self.predictor_net(x_n)
-
-            intr = (p - t).pow(2).mean(dim=1, keepdim=True)
-            intr = intr.clamp_min(clamp_min)  # keep curiosity from vanishing
-
-            if normalise_reward:
-                # RunningStat.update accepts tensors on any device
-                self.rew_normaliser.update(intr)
-                rm = self._to_stat_tensor(self.rew_normaliser.mean, intr.device, intr.dtype)
-                rs = self._to_stat_tensor(self.rew_normaliser.std,  intr.device, intr.dtype)
-                intr = (intr - rm) / (rs + self._eps)
-
-        return intr  # already detached by no_grad
-
+    def update_reward_stats(self, rewards):
+        self.rew_normaliser.update(rewards.detach().cpu())
 
     def compute_loss(self, obs):
        
@@ -314,35 +242,45 @@ class CentralizedCriticNet(nn.Module):
     def __init__(self, per_agent_dim, action_dim, num_agents):
         super().__init__()
         self.num_agents = num_agents
-        self.per_agent_dim = per_agent_dim
-        self.action_dim = action_dim
         centralized_input_dim = num_agents * (per_agent_dim + action_dim)
         
-
+        # Shared backbone
         self.backbone = nn.Sequential(
-            nn.Linear(centralized_input_dim,512),
+            nn.Linear(centralized_input_dim, 512),
             nn.LayerNorm(512),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Linear(512, 256),
             nn.LayerNorm(256),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
         )
-
-        self.q_head_1 = nn.Linear(256,1)
-        self.q_head_2 = nn.Linear(256,1)
-
-        self.apply(safe_orthogonal_initialization)
-
+        
+        # PER-AGENT Q-heads (not joint!)
+        self.q1_heads = nn.ModuleList([
+            nn.Linear(256, 1) for _ in range(num_agents)
+        ])
+        self.q2_heads = nn.ModuleList([
+            nn.Linear(256, 1) for _ in range(num_agents)
+        ])
+    
     def forward(self, feats, actions):
+        # feats: (B*N, feat_dim), actions: (B*N, act_dim)
         batch_size = feats.shape[0] // self.num_agents
+        
+        # Centralize input
         x_per_agent = torch.cat([feats, actions], dim=-1)
         x_centralized = x_per_agent.view(batch_size, -1)
-
-        h = self.backbone(x_centralized)  # [batch_size, 256]
-
-        q1s = self.q_head_1(h)
-        q2s = self.q_head_2(h)
-        return q1s, q2s
+        
+        # Shared representation
+        h = self.backbone(x_centralized)  # (B, 256)
+        
+        # Per-agent Q-values
+        q1_list = [head(h) for head in self.q1_heads]  # List of (B, 1)
+        q2_list = [head(h) for head in self.q2_heads]
+        
+        q1 = torch.cat(q1_list, dim=1).view(batch_size * self.num_agents, 1)
+        q2 = torch.cat(q2_list, dim=1).view(batch_size * self.num_agents, 1)
+        
+        return q1, q2  # (B*N, 1) - per-agent values!
     
 class GaussianPolicy(nn.Module):
     def __init__(self, input_dim, act_dim):
