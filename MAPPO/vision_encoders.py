@@ -30,6 +30,18 @@ class EfficientVisionEncoder(nn.Module):
             nn.Conv2d(channels, 32, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
             
             # Global Average Pooling
             nn.AdaptiveAvgPool2d(1),
@@ -37,9 +49,9 @@ class EfficientVisionEncoder(nn.Module):
         )
         
         
-        if output_dim != 32:
+        if output_dim != 512:
             self.projection = nn.Sequential(
-                nn.Linear(32, output_dim),
+                nn.Linear(512, output_dim),
                 nn.LayerNorm(output_dim),
                 nn.Tanh()
             )

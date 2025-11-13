@@ -17,7 +17,7 @@ class MAPPOActor(nn.Module):
     All agents share the same network parameters (params sharing), which yields faster learning, better generalization and smaller models.
     """
 
-    def __init__(self, obs_dim, action_dim, hidden_dim=256):
+    def __init__(self, obs_dim, action_dim, hidden_dim=256, min_std=0.1):
         """
         obs_dim: Dimension of encoded observations (vision + vector)
         action_dim: Dimension of action space
@@ -39,6 +39,9 @@ class MAPPOActor(nn.Module):
         self.mean_layer = nn.Linear(hidden_dim, action_dim)
         self.log_std_layer = nn.Linear(hidden_dim, action_dim)
 
+        self.min_std = min_std
+        self.max_std = 1.0
+
         #Init weights properly, small weights for policy head prevent large initial policy changes
         self._init_weights()
 
@@ -57,6 +60,8 @@ class MAPPOActor(nn.Module):
         #Policy head gets special small init
         nn.init.orthogonal_(self.mean_layer.weight, gain=0.01)
         nn.init.constant_(self.mean_layer.bias, 0)
+        nn.init.orthogonal_(self.log_std_layer.weight, gain=0.01)
+        nn.init.constant_(self.log_std_layer.bias, np.log(0.3))
 
     def forward(self, obs):
         """
@@ -73,8 +78,11 @@ class MAPPOActor(nn.Module):
 
         #Log std
         #Clamp to prevent issues
-        action_log_std = torch.clamp(self.log_std_layer(features), -20,2)
+        action_log_std = torch.clamp(self.log_std_layer(features), np.log(self.min_std), np.log(self.max_std))
         action_std = torch.exp(action_log_std)
+
+        assert action_std.min() >= self.min_std - 1e-3, "Std too small"
+        assert action_std.max() <= self.max_std + 1e-3, "Std too large"
 
         #Gauss dist, agents sample from this for actions
         dist = torch.distributions.Normal(action_mean, action_std)

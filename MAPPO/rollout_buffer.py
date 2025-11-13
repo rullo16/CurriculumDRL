@@ -127,7 +127,6 @@ class RolloutBuffer:
         advantages_flat = self.advantages.reshape(-1)
         adv_mean = advantages_flat.mean()
         adv_std = advantages_flat.std()
-        self.advantages = (self.advantages - adv_mean) / (adv_std + 1e-8)
         self.advantages = np.clip(self.advantages, -10, 10)
 
         self.ptr = 0
