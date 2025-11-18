@@ -20,6 +20,23 @@ from .curiosity import CuriosityModule, RunningMeanStd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class KLDivergenceEntropyScheduler:
+    def __init__ (self):
+        self.target_kl = 0.02
+        self.entropy_coef = 0.1
+        self.min_entropy_coef = 0.001
+
+    def update(self, current_kl):
+        if current_kl > self.target_kl:
+            self.entropy_coef = min(self.entropy_coef * 1.5, 0.10)
+        elif current_kl < self.target_kl * 0.5:
+            self.entropy_coef = max(self.entropy_coef * 0.9, self.min_entropy_coef)
+        
+        return self.entropy_coef
+    
+    def switch_env(self):
+        self.entropy_coef = 0.1
+
 class MAPPOAgent:
     """
     MAPPO agent
@@ -120,6 +137,8 @@ class MAPPOAgent:
             T_max = config.get('max_steps', 3000000) // self.num_steps,
             eta_min=self.lr*0.1
         )
+
+        self.entropy_scheduler = KLDivergenceEntropyScheduler()
 
         #Statistics tracking
         self.episode_rewards = []
@@ -441,6 +460,7 @@ class MAPPOAgent:
                 stats['explained_variance'].append(explained_var)
 
         self.scheduler.step()
+        self.entropy_coef = self.entropy_scheduler.update(np.mean(stats['approx_kl']))
         
         #Return averaged statistics
         return {k: np.mean(v) for k,v in stats.items()}
