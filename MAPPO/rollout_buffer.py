@@ -31,6 +31,7 @@ class RolloutBuffer:
 
         #Storage arrays
         self.observations = np.zeros((num_steps, num_agents, *obs_shape), dtype=np.float32)
+        self.next_observations = np.zeros((num_steps, num_agents, *obs_shape), dtype=np.float32)
         self.actions = np.zeros((num_steps, num_agents, action_dim), dtype=np.float32)
         self.rewards = np.zeros((num_steps, num_agents), dtype=np.float32)
         self.dones = np.zeros((num_steps, num_agents), dtype=np.float32)
@@ -43,7 +44,7 @@ class RolloutBuffer:
 
         self.ptr = 0
 
-    def store(self,obs, action, reward, done, value, log_prob):
+    def store(self,obs, next_obs, action, reward, done, value, log_prob):
         """
         Store one transition for all agents
         obs: (num_agents, obs_dim) - encoded observations
@@ -57,6 +58,7 @@ class RolloutBuffer:
             raise ValueError(f"Buffer Full! Called store() {self.ptr+1} times but buffer size is {self.num_steps}")
         
         self.observations[self.ptr] = obs
+        self.next_observations[self.ptr] = next_obs
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.dones[self.ptr] = done
@@ -133,6 +135,7 @@ class RolloutBuffer:
 
         return {
             'observations': self.observations.copy(),
+            'next_observations': self.next_observations.copy(),
             'actions': self.actions.copy(),
             'returns': self.returns.copy(),
             'advantages': self.advantages.copy(),

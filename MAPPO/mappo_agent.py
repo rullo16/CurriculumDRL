@@ -27,10 +27,14 @@ class KLDivergenceEntropyScheduler:
         self.min_entropy_coef = 0.001
 
     def update(self, current_kl):
+
+        if np.isnan(current_kl) or np.isinf(current_kl):
+            return self.entropy_coef
+        
         if current_kl > self.target_kl:
             self.entropy_coef = min(self.entropy_coef * 1.5, 0.10)
         elif current_kl < self.target_kl * 0.5:
-            self.entropy_coef = max(self.entropy_coef * 0.9, self.min_entropy_coef)
+            self.entropy_coef = max(self.entropy_coef * 0.99, self.min_entropy_coef)
         
         return self.entropy_coef
     
@@ -203,7 +207,7 @@ class MAPPOAgent:
             intrinsic_rewards = intrinsic_rewards.detach().cpu().numpy()
 
             self.intrinsic_reward_normalizer.update(intrinsic_rewards)
-            intrinsic_rewards = intrinsic_rewards / (self.intrinsic_reward_normalizer.std + 1e-8)
+            intrinsic_rewards = (intrinsic_rewards-self.intrinsic_reward_normalizer.mean) / (self.intrinsic_reward_normalizer.std + 1e-8)
 
             intrinsic_rewards = np.clip(intrinsic_rewards, -self.reward_clip, self.reward_clip)
 
@@ -260,6 +264,7 @@ class MAPPOAgent:
         # STEP 1: Load data from buffer
         # ================================================================
         obs = torch.tensor(data['observations'], dtype=torch.float32).to(self.device)
+        next_obs = torch.tensor(data['next_observations'], dtype=torch.float32).to(self.device)
         actions = torch.tensor(data['actions'], dtype=torch.float32).to(self.device)
         returns = torch.tensor(data['returns'], dtype=torch.float32).to(self.device)
         advantages = torch.tensor(data['advantages'], dtype=torch.float32).to(self.device)
@@ -286,7 +291,7 @@ class MAPPOAgent:
         # ================================================================
         # Buffer returns: (total_samples, feature_dim) = (2048, 384)
         # We need: (num_steps, num_agents, feature_dim) = (512, 4, 384)
-        
+
         if len(obs.shape) == 2:  # Flattened format detected
             total_samples = obs.shape
             expected_total = self.num_steps * self.num_agents
@@ -299,6 +304,7 @@ class MAPPOAgent:
             
             print("⚠️  Reshaping flattened buffer data...")
             obs = obs.reshape(self.num_steps, self.num_agents, self.encoded_obs_dim)
+            next_obs = next_obs.reshape(self.num_steps, self.num_agents, self.encoded_obs_dim)
             actions = actions.reshape(self.num_steps, self.num_agents, self.action_dim)
             returns = returns.reshape(self.num_steps, self.num_agents)
             advantages = advantages.reshape(self.num_steps, self.num_agents)
@@ -355,6 +361,7 @@ class MAPPOAgent:
 
                 #Get mini-batch
                 mb_obs = obs[mb_indices]
+                mb_next_obs = next_obs[mb_indices]
                 mb_actions = actions[mb_indices]
                 mb_returns = returns[mb_indices]
                 mb_advantages = advantages[mb_indices]
@@ -363,6 +370,7 @@ class MAPPOAgent:
                 #Policy Loss
 
                 mb_obs_flat = mb_obs.reshape(-1, self.encoded_obs_dim)
+                mb_next_obs_flat = mb_next_obs.reshape(-1, self.encoded_obs_dim)
                 mb_actions_flat = mb_actions.reshape(-1, self.action_dim)
                 mb_advantages_flat = mb_advantages.reshape(-1)
                 mb_old_log_probs_flat = mb_old_log_probs.reshape(-1)
@@ -407,8 +415,7 @@ class MAPPOAgent:
                 curiosity_obs = mb_obs_flat[curiosity_indices]
                 curiosity_actions = mb_actions_flat[curiosity_indices]
 
-                next_indices = (curiosity_indices + 1) % len(mb_obs_flat)
-                curiosity_next_obs = mb_obs_flat[next_indices]
+                curiosity_next_obs = mb_next_obs[curiosity_indices]
 
                 _, curiosity_loss = self.curiosity_module(
                     curiosity_obs,
