@@ -1,8 +1,31 @@
-name: mlagents
+name: mappo_drone_rl
 channels:
+  # PyTorch channel for the latest stable releases
+  - pytorch
+  # Common channel for machine learning and utility packages
+  - conda-forge
   - defaults
 dependencies:
-  - python=3.10.12
-  - m2-base
+  # Core Python Version
+  - python=3.10
+
+  # Fundamental Libraries
+  - numpy
+  - matplotlib
+  - tqdm
+  
+  # PyTorch (will install CPU version by default)
+  - pytorch
+  - torchvision
+  - torchaudio
+
+  # Jupyter Notebook/Conda Setup
   - ipykernel
-prefix: C:\Users\rullo\anaconda3\envs\mlagents
+  - pip
+
+  # Libraries best installed via pip (especially for ML-Agents and WandB)
+  - pip:
+    # ML-Agents: Core library for interacting with the Unity environment
+    - mlagents
+    # Logging: Weights & Biases for experiment tracking
+    - wandb

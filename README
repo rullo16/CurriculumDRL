@@ -44,7 +44,7 @@ Additionally, the project includes a **Model Predictive Control (MPC)** baseline
     - **MAPPO Agent** (mappo_agent.py): The primary reinforcement learning agent. It fuses visual features (from the CNN) with vector data (velocity, distance to target) via a projection layer. It manages the optimization of the Actor, Critic, Vision Encoder, and Curiosity module.
     - **MPC Agent** (MPC_Agent.py): A non-learning baseline that uses Model Predictive Control (MPC) to optimize trajectory planning over a finite time horizon.
 2. **Neural Networks** (models.py):
-    - **Vision Encoder**: Processes (C, H, W) camera inputs. It can be trained end-to-end with the policy or pre-trained using PretrainFeatureExtraction.ipynb to learn robust visual representations before RL training begins.ù
+    - **Vision Encoder**: Processes (C, H, W) camera inputs. It can be trained end-to-end with the policy or pre-trained using `PretrainFeatureExtraction.ipynb` to learn robust visual representations before RL training begins.
     - **Actor**: A Gaussian policy network that outputs continuous actions (tanh squashed).
     - **Critic**: A centralized value network that takes the concatenated observations of all agents to predict state value.
 3. **Curiosity Module** (curiosity.py):
@@ -59,21 +59,21 @@ Option 1: Conda (Recommended)
 
 Use the provided environment.yml to create a consistent environment:
 
-```Bash
+```bash
 conda env create -f environment.yml
 conda activate ml-agents  # Or the name specified in the .yml file
 ```
 
 Option 2: Pip
 
-    Prerequisites: Python 3.8+, Unity ML-Agents Toolkit.
+Prerequisites: Python 3.8+ and the Unity ML-Agents Toolkit.
 
-    Dependencies:
-    ```Bash
+Dependencies (example):
+```bash
+pip install torch numpy mlagents wandb
+```
 
-    pip install torch numpy mlagents wandb
-    ```
-    Environment Setup: Ensure your Unity environment builds are placed in the ./Env/ directory as referenced in the notebooks (e.g., ./Env/Level1/DroneFlightv1).
+Environment setup: ensure your Unity environment builds are placed in the `./Env/` directory as referenced in the notebooks (for example, `./Env/Level1/DroneFlightv1`).
 
 
 ## Usage
@@ -93,32 +93,27 @@ Before training the RL agent, you can pre-train the vision encoder to recognize 
 There are two modes for training the MAPPO agent:
 
     Curriculum Learning (Standard):
-    ```Bash
-
-jupyter notebook MAPPO_train.ipynb
-
-```
+    ```bash
+    jupyter notebook MAPPO_train.ipynb
+    ```
 Starts with simple tasks and progressively increases difficulty based on success rates.
 
 No Curriculum (Hard Mode):
-```Bash
-
-    jupyter notebook MAPPO_train_no_curriculum.ipynb
+```bash
+jupyter notebook MAPPO_train_no_curriculum.ipynb
 ```
     Trains directly on the target environment difficulty.
 
 3. Run MPC Baseline
 
 To evaluate the Model Predictive Control baseline:
-```Bash
-
+```bash
 jupyter notebook MCP_train.ipynb
 ```
 4. Configuration
 
 Inside the notebooks, you can adjust the config dictionary to tune hyperparameters:
-```Python
-
+```python
 config = {
     'learning_rate': 3e-4,
     'entropy_coef': 0.1,      # Higher for more exploration
