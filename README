@@ -6,7 +6,7 @@ The system utilizes a **Centralized Training, Decentralized Execution (CTDE)** a
 
 Additionally, the project includes a **Model Predictive Control (MPC)** baseline and tools for **Self-Supervised Pre-training** of the visual encoder.
 
-## 🌟 Key Features
+## Key Features
 
 * **Algorithm:** MAPPO (Multi-Agent PPO) with Generalized Advantage Estimation (GAE).
 * **CTDE Architecture:** 
@@ -20,7 +20,7 @@ Additionally, the project includes a **Model Predictive Control (MPC)** baseline
 
 ***
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 .
