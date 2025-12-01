@@ -14,7 +14,7 @@ Additionally, the project includes a **Model Predictive Control (MPC)** baseline
     * **Critic (Centralized):** Estimates value based on the global state of all agents during training.
 * **Visual Perception:** Uses an **EfficientVisionEncoder** (based on MobileNet/EfficientNet concepts) with depthwise separable convolutions. Supports **pre-training** to improve feature extraction efficiency.
 * **Exploration:** Integrated **Curiosity Module** (Forward/Inverse dynamics models) to generate intrinsic rewards for exploring novel states.
-* **Curriculum Learning:** Supports a 4-stage curriculum to gradually increase environmental difficulty based on success rates.
+* **Curriculum Learning:** Supports a 4-stage curriculum to increase environmental difficulty based on success rates gradually.
 * **Baselines:** Includes an **MPC Agent** for control-theoretic performance comparison.
 * **Monitoring:** Integrated **Weights & Biases (WandB)** logging for real-time training metrics.
 
@@ -41,7 +41,7 @@ Additionally, the project includes a **Model Predictive Control (MPC)** baseline
 ## Architecture Details
 
 1. **The Agent**:
-    - **MAPPO Agent** (mappo_agent.py): The primary reinforcement learning agent. It fuses visual features (from the CNN) with vector data (velocity, distance to target) via a projection layer. It manages the optimization of the Actor, Critic, Vision Encoder, and Curiosity module.
+    - **MAPPO Agent** (mappo_agent.py): The primary reinforcement learning agent. It fuses visual features (from the CNN) with vector data (velocity and distance to the target) via a projection layer. It manages the optimization of the Actor, Critic, Vision Encoder, and Curiosity module.
     - **MPC Agent** (MPC_Agent.py): A non-learning baseline that uses Model Predictive Control (MPC) to optimize trajectory planning over a finite time horizon.
 2. **Neural Networks** (models.py):
     - **Vision Encoder**: Processes (C, H, W) camera inputs. It can be trained end-to-end with the policy or pre-trained using `PretrainFeatureExtraction.ipynb` to learn robust visual representations before RL training begins.
@@ -102,7 +102,7 @@ No Curriculum (Hard Mode):
 ```bash
 jupyter notebook MAPPO_train_no_curriculum.ipynb
 ```
-    Trains directly on the target environment difficulty.
+    Trains directly on the target environment's difficulty.
 
 3. Run MPC Baseline
 
